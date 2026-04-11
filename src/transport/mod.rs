@@ -3,7 +3,7 @@ pub mod peer;
 pub mod signaling;
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Connection state shared across threads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,20 +26,42 @@ impl ConnState {
     }
 }
 
+/// ICE candidate pair information for diagnostics.
+#[derive(Clone, Debug)]
+pub struct IceInfo {
+    pub local_type: String,
+    pub remote_type: String,
+    pub relay: bool,
+}
+
 /// Thread-safe shared connection state.
 #[derive(Clone)]
-pub struct SharedConnState(Arc<AtomicU8>);
+pub struct SharedConnState {
+    state: Arc<AtomicU8>,
+    ice_info: Arc<Mutex<Option<IceInfo>>>,
+}
 
 impl SharedConnState {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(ConnState::Connecting as u8)))
+        Self {
+            state: Arc::new(AtomicU8::new(ConnState::Connecting as u8)),
+            ice_info: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn get(&self) -> ConnState {
-        ConnState::from_u8(self.0.load(Ordering::Relaxed))
+        ConnState::from_u8(self.state.load(Ordering::Relaxed))
     }
 
     pub fn set(&self, state: ConnState) {
-        self.0.store(state as u8, Ordering::Relaxed);
+        self.state.store(state as u8, Ordering::Relaxed);
+    }
+
+    pub fn set_ice_info(&self, info: IceInfo) {
+        *self.ice_info.lock().unwrap() = Some(info);
+    }
+
+    pub fn get_ice_info(&self) -> Option<IceInfo> {
+        self.ice_info.lock().unwrap().clone()
     }
 }

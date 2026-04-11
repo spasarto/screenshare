@@ -1,27 +1,9 @@
 use crate::app::SessionEvent;
 use crate::capture::picker::{self, WindowInfo};
 use crate::transport::{ConnState, SharedConnState};
+use crate::turn::TurnConfig;
 use egui::TextureHandle;
-use rand::Rng;
 use std::sync::{Arc, Mutex};
-
-fn generate_uuid_v4() -> String {
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
-    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        u16::from_be_bytes([bytes[4], bytes[5]]),
-        u16::from_be_bytes([bytes[6], bytes[7]]),
-        u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([
-            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-        ]),
-    )
-}
 
 pub struct DecodedFrame {
     pub width: u32,
@@ -86,7 +68,7 @@ impl App {
         let has_windows = !windows.is_empty();
         Self {
             phase: Phase::Setup,
-            passphrase: generate_uuid_v4(),
+            passphrase: "zelda".to_string(),
             windows,
             selected_window: if has_windows { Some(0) } else { None },
             role: Role::Create,
@@ -241,7 +223,8 @@ impl App {
                 self.event_rx = Some(event_rx);
                 self.answer_tx = Some(answer_tx);
 
-                crate::app::spawn_offerer(passphrase, window, event_tx, answer_rx);
+                let turn = TurnConfig::from_env().expect("TURN env vars must be set");
+                crate::app::spawn_offerer(passphrase, window, turn, event_tx, answer_rx);
                 self.phase = Phase::GeneratingOffer;
             }
             Role::Join => {
@@ -356,7 +339,8 @@ impl App {
                         let (event_tx, event_rx) = std::sync::mpsc::channel();
                         self.event_rx = Some(event_rx);
 
-                        crate::app::spawn_answerer(passphrase, window, offer, event_tx);
+                        let turn = TurnConfig::from_env().expect("TURN env vars must be set");
+                        crate::app::spawn_answerer(passphrase, window, offer, turn, event_tx);
                         self.phase = Phase::GeneratingAnswer;
                     }
                 });
@@ -466,6 +450,18 @@ impl App {
                     ConnState::Connecting => (egui::Color32::YELLOW, "Connecting..."),
                 };
                 ui.colored_label(color, text);
+
+                if let Some(ice) = self.conn_state.as_ref().and_then(|cs| cs.get_ice_info()) {
+                    ui.separator();
+                    if ice.relay {
+                        ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "Relayed (TURN)");
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::GREEN,
+                            format!("Direct ({})", ice.local_type),
+                        );
+                    }
+                }
             });
         });
 

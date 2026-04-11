@@ -17,6 +17,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::stats::StatsReportType;
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const BACKOFF_BASE_MS: u64 = 1000;
@@ -35,7 +36,7 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
-    pub async fn new(conn_state: SharedConnState) -> Result<Self> {
+    pub async fn new(conn_state: SharedConnState, ice_servers: Vec<RTCIceServer>) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -51,16 +52,7 @@ impl PeerConnection {
             .build();
 
         let config = RTCConfiguration {
-            ice_servers: vec![
-                RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                },
-                RTCIceServer {
-                    urls: vec!["stun:stun1.l.google.com:19302".to_string()],
-                    ..Default::default()
-                },
-            ],
+            ice_servers,
             ..Default::default()
         };
 
@@ -92,6 +84,46 @@ impl PeerConnection {
                 match s {
                     RTCPeerConnectionState::Connected => {
                         state.set(ConnState::Connected);
+                        // Query ICE stats to determine connection type
+                        if let Some(pc) = pc2.upgrade() {
+                            let stats = pc.get_stats().await;
+                            let mut local_type = String::new();
+                            let mut remote_type = String::new();
+                            // Find the nominated candidate pair
+                            let mut local_id = String::new();
+                            let mut remote_id = String::new();
+                            for report in stats.reports.values() {
+                                if let StatsReportType::CandidatePair(pair) = report {
+                                    if pair.nominated {
+                                        local_id = pair.local_candidate_id.clone();
+                                        remote_id = pair.remote_candidate_id.clone();
+                                        break;
+                                    }
+                                }
+                            }
+                            if !local_id.is_empty() {
+                                for report in stats.reports.values() {
+                                    match report {
+                                        StatsReportType::LocalCandidate(c) if c.id == local_id => {
+                                            local_type = format!("{}", c.candidate_type);
+                                        }
+                                        StatsReportType::RemoteCandidate(c) if c.id == remote_id => {
+                                            remote_type = format!("{}", c.candidate_type);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            let relay = local_type == "relay" || remote_type == "relay";
+                            tracing::info!(
+                                "ICE selected pair: local={local_type} remote={remote_type} relay={relay}"
+                            );
+                            state.set_ice_info(super::IceInfo {
+                                local_type,
+                                remote_type,
+                                relay,
+                            });
+                        }
                     }
                     RTCPeerConnectionState::Disconnected => {
                         state.set(ConnState::Reconnecting);

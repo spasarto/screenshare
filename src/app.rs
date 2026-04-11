@@ -4,6 +4,7 @@ use crate::crypto::Crypto;
 use crate::transport::framing::IncomingMessage;
 use crate::transport::peer::{self, PeerConnection};
 use crate::transport::{ConnState, SharedConnState};
+use crate::turn::TurnConfig;
 use crate::viewer::DecodedFrame;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -34,13 +35,14 @@ pub enum SessionEvent {
 pub fn spawn_offerer(
     passphrase: String,
     window: Window,
+    turn: TurnConfig,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
     answer_rx: std::sync::mpsc::Receiver<String>,
 ) {
     std::thread::Builder::new()
         .name("session-offerer".into())
         .spawn(move || {
-            if let Err(e) = run_offerer(passphrase, window, &event_tx, answer_rx) {
+            if let Err(e) = run_offerer(passphrase, window, turn, &event_tx, answer_rx) {
                 let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
             }
         })
@@ -52,12 +54,13 @@ pub fn spawn_answerer(
     passphrase: String,
     window: Window,
     offer: String,
+    turn: TurnConfig,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
 ) {
     std::thread::Builder::new()
         .name("session-answerer".into())
         .spawn(move || {
-            if let Err(e) = run_answerer(passphrase, window, &offer, &event_tx) {
+            if let Err(e) = run_answerer(passphrase, window, &offer, turn, &event_tx) {
                 let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
             }
         })
@@ -67,6 +70,7 @@ pub fn spawn_answerer(
 fn run_offerer(
     passphrase: String,
     window: Window,
+    turn: TurnConfig,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
     answer_rx: std::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
@@ -81,7 +85,8 @@ fn run_offerer(
     let _rt = tokio::runtime::Runtime::new()?;
 
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
-        let mut peer = PeerConnection::new(conn_state.clone()).await?;
+        let ice_servers = turn.fetch_ice_servers().await?;
+        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
         let offer_blob = peer.create_offer(&crypto).await?;
 
         event_tx
@@ -144,6 +149,7 @@ fn run_answerer(
     passphrase: String,
     window: Window,
     offer: &str,
+    turn: TurnConfig,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
     let crypto = Crypto::from_passphrase(&passphrase)?;
@@ -157,7 +163,8 @@ fn run_answerer(
     let _rt = tokio::runtime::Runtime::new()?;
 
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
-        let mut peer = PeerConnection::new(conn_state.clone()).await?;
+        let ice_servers = turn.fetch_ice_servers().await?;
+        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
         let answer_blob = peer.accept_offer(offer, &crypto).await?;
 
         event_tx
