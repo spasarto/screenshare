@@ -64,13 +64,17 @@ impl PeerConnection {
         // Monitor connection state
         let pc2 = Arc::downgrade(&pc);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-            tracing::info!("Connection state: {state}");
-            if state == RTCPeerConnectionState::Failed {
-                if let Some(pc) = pc2.upgrade() {
-                    let _ = pc.close();
+            let pc2 = pc2.clone();
+            Box::pin(async move {
+                tracing::info!("Connection state: {state}");
+                if state == RTCPeerConnectionState::Failed {
+                    if let Some(pc) = pc2.upgrade() {
+                        if let Err(err) = pc.close().await {
+                            tracing::warn!("Failed to close peer connection after failure: {err}");
+                        }
+                    }
                 }
-            }
-            Box::pin(async {})
+            })
         }));
 
         // Handle incoming data channels (answerer side receives the offerer's channel)

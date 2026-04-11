@@ -52,8 +52,7 @@ pub struct H264Decoder {
 
 impl H264Decoder {
     pub fn new() -> Result<Self> {
-        let decoder =
-            Decoder::new().context("Failed to create H264 decoder")?;
+        let decoder = Decoder::new().context("Failed to create H264 decoder")?;
         Ok(Self { decoder })
     }
 

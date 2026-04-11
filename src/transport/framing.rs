@@ -8,7 +8,6 @@
 /// - Single message:  [0x00][4-byte BE total_len][payload]
 /// - Chunked start:   [0x01][4-byte BE total_len]
 /// - Chunked data:    [0x02][chunk_payload]
-
 const MAX_CHUNK_PAYLOAD: usize = 15000; // Well under 16KB SCTP limit
 
 /// Split a message into data channel frames.
