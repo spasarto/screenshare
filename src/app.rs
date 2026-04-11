@@ -4,7 +4,7 @@ use crate::crypto::Crypto;
 use crate::transport::framing::IncomingMessage;
 use crate::transport::peer::{self, PeerConnection};
 use crate::transport::{ConnState, SharedConnState};
-use crate::viewer::{DecodedFrame, ViewerApp};
+use crate::viewer::DecodedFrame;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -20,99 +20,215 @@ pub enum Role {
     Answerer,
 }
 
-pub struct SessionConfig {
-    pub passphrase: String,
-    pub window: Window,
-    pub role: Role,
+pub enum SessionEvent {
+    OfferReady(String),
+    AnswerReady(String),
+    SessionReady {
+        frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
+        conn_state: SharedConnState,
+    },
+    Error(String),
 }
 
-pub fn run(config: SessionConfig) -> Result<()> {
-    let crypto = Crypto::from_passphrase(&config.passphrase)?;
+/// Spawn the offerer session in a background thread.
+pub fn spawn_offerer(
+    passphrase: String,
+    window: Window,
+    event_tx: std::sync::mpsc::Sender<SessionEvent>,
+    answer_rx: std::sync::mpsc::Receiver<String>,
+) {
+    std::thread::Builder::new()
+        .name("session-offerer".into())
+        .spawn(move || {
+            if let Err(e) = run_offerer(passphrase, window, &event_tx, answer_rx) {
+                let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
+            }
+        })
+        .expect("Failed to spawn offerer thread");
+}
 
-    // Frame buffer shared between decoder thread and egui viewer
+/// Spawn the answerer session in a background thread.
+pub fn spawn_answerer(
+    passphrase: String,
+    window: Window,
+    offer: String,
+    event_tx: std::sync::mpsc::Sender<SessionEvent>,
+) {
+    std::thread::Builder::new()
+        .name("session-answerer".into())
+        .spawn(move || {
+            if let Err(e) = run_answerer(passphrase, window, &offer, &event_tx) {
+                let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
+            }
+        })
+        .expect("Failed to spawn answerer thread");
+}
+
+fn run_offerer(
+    passphrase: String,
+    window: Window,
+    event_tx: &std::sync::mpsc::Sender<SessionEvent>,
+    answer_rx: std::sync::mpsc::Receiver<String>,
+) -> Result<()> {
+    let crypto = Crypto::from_passphrase(&passphrase)?;
     let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
     let conn_state = SharedConnState::new();
 
-    // Capture → Encoder channel (std sync, both are OS threads)
     let (capture_tx, capture_rx) =
         std::sync::mpsc::sync_channel::<capture::Frame>(FRAME_CHANNEL_SIZE);
-
-    // Encoder → Transport sender channel (tokio)
     let (encoded_tx, encoded_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_SIZE);
 
-    // Build the tokio runtime for async WebRTC work
-    let rt = tokio::runtime::Runtime::new()?;
+    let _rt = tokio::runtime::Runtime::new()?;
 
-    let role = config.role;
-
-    // Do signaling in the runtime
-    let (_dc_holder, incoming_rx, signaling_tx) = rt.block_on(async {
+    let (incoming_rx, signaling_tx) = _rt.block_on(async {
         let mut peer = PeerConnection::new(conn_state.clone()).await?;
+        let offer_blob = peer.create_offer(&crypto).await?;
 
-        match config.role {
-            Role::Offerer => {
-                let offer_blob = peer.create_offer(&crypto).await?;
-                println!("\n========== YOUR CONNECTION CODE ==========");
-                println!("{offer_blob}");
-                println!("==========================================");
-                println!("\nSend this code to your peer, then paste their response below:");
+        event_tx
+            .send(SessionEvent::OfferReady(offer_blob))
+            .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
 
-                let mut answer_input = String::new();
-                std::io::stdin().read_line(&mut answer_input)?;
-                peer.set_answer(answer_input.trim(), &crypto).await?;
-            }
-            Role::Answerer => {
-                println!("\nPaste the connection code from your peer:");
-                let mut offer_input = String::new();
-                std::io::stdin().read_line(&mut offer_input)?;
+        // Block until the GUI sends the answer
+        let answer = answer_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
 
-                let answer_blob = peer.accept_offer(offer_input.trim(), &crypto).await?;
-                println!("\n========== YOUR RESPONSE CODE ==========");
-                println!("{answer_blob}");
-                println!("=========================================");
-                println!("\nSend this code back to your peer. Connecting...");
-            }
-        }
+        peer.set_answer(&answer, &crypto).await?;
 
         let dc_holder = peer.data_channel();
         let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");
         let signaling_tx = peer.signaling_tx();
-        let signaling_rx = peer.take_signaling_rx().expect("signaling_rx already taken");
+        let signaling_rx = peer
+            .take_signaling_rx()
+            .expect("signaling_rx already taken");
 
-        // Spawn the network sender task
         peer::spawn_sender(dc_holder.clone(), encoded_rx, conn_state.clone());
-
-        // Spawn the reconnection monitor
         peer::spawn_reconnect_monitor(
             peer.rtc_pc(),
             dc_holder.clone(),
             peer.disconnect_notify(),
             signaling_rx,
             conn_state.clone(),
-            role,
+            Role::Offerer,
         );
 
-        anyhow::Ok((dc_holder, incoming_rx, signaling_tx))
+        anyhow::Ok((incoming_rx, signaling_tx))
     })?;
 
-    tracing::info!("Signaling complete, starting capture and viewer");
+    tracing::info!("Offerer signaling complete, starting media threads");
+    start_media_threads(
+        window,
+        capture_tx,
+        capture_rx,
+        encoded_tx,
+        incoming_rx,
+        signaling_tx,
+        frame_buffer.clone(),
+        conn_state.clone(),
+    )?;
 
-    // Start the capture thread (Windows Graphics Capture, runs its own event loop)
-    let _capture_handle =
-        capture::wgc::start_capture(config.window, capture_tx, TARGET_WIDTH, TARGET_HEIGHT)?;
+    event_tx
+        .send(SessionEvent::SessionReady {
+            frame_buffer,
+            conn_state,
+        })
+        .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
 
-    // Start the encoder thread (CPU-bound, reads captured frames, sends H264)
-    let _encoder_handle = std::thread::Builder::new()
+    // Keep thread alive so the tokio runtime and spawned tasks stay alive
+    loop {
+        std::thread::park();
+    }
+}
+
+fn run_answerer(
+    passphrase: String,
+    window: Window,
+    offer: &str,
+    event_tx: &std::sync::mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let crypto = Crypto::from_passphrase(&passphrase)?;
+    let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
+    let conn_state = SharedConnState::new();
+
+    let (capture_tx, capture_rx) =
+        std::sync::mpsc::sync_channel::<capture::Frame>(FRAME_CHANNEL_SIZE);
+    let (encoded_tx, encoded_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_SIZE);
+
+    let _rt = tokio::runtime::Runtime::new()?;
+
+    let (incoming_rx, signaling_tx) = _rt.block_on(async {
+        let mut peer = PeerConnection::new(conn_state.clone()).await?;
+        let answer_blob = peer.accept_offer(offer, &crypto).await?;
+
+        event_tx
+            .send(SessionEvent::AnswerReady(answer_blob))
+            .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
+
+        let dc_holder = peer.data_channel();
+        let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");
+        let signaling_tx = peer.signaling_tx();
+        let signaling_rx = peer
+            .take_signaling_rx()
+            .expect("signaling_rx already taken");
+
+        peer::spawn_sender(dc_holder.clone(), encoded_rx, conn_state.clone());
+        peer::spawn_reconnect_monitor(
+            peer.rtc_pc(),
+            dc_holder.clone(),
+            peer.disconnect_notify(),
+            signaling_rx,
+            conn_state.clone(),
+            Role::Answerer,
+        );
+
+        anyhow::Ok((incoming_rx, signaling_tx))
+    })?;
+
+    tracing::info!("Answerer signaling complete, starting media threads");
+    start_media_threads(
+        window,
+        capture_tx,
+        capture_rx,
+        encoded_tx,
+        incoming_rx,
+        signaling_tx,
+        frame_buffer.clone(),
+        conn_state.clone(),
+    )?;
+
+    event_tx
+        .send(SessionEvent::SessionReady {
+            frame_buffer,
+            conn_state,
+        })
+        .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
+
+    loop {
+        std::thread::park();
+    }
+}
+
+fn start_media_threads(
+    window: Window,
+    capture_tx: std::sync::mpsc::SyncSender<capture::Frame>,
+    capture_rx: std::sync::mpsc::Receiver<capture::Frame>,
+    encoded_tx: mpsc::Sender<Vec<u8>>,
+    incoming_rx: mpsc::Receiver<Vec<u8>>,
+    signaling_tx: mpsc::Sender<Vec<u8>>,
+    frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
+    conn_state: SharedConnState,
+) -> Result<()> {
+    capture::wgc::start_capture(window, capture_tx, TARGET_WIDTH, TARGET_HEIGHT)?;
+
+    std::thread::Builder::new()
         .name("encoder".into())
         .spawn(move || {
             let mut encoder: Option<H264Encoder> = None;
 
             while let Ok(frame) = capture_rx.recv() {
-                // Ensure dimensions are even (H264 requirement)
                 let w = frame.width & !1;
                 let h = frame.height & !1;
 
-                // Lazily create encoder matching actual capture dimensions
                 if encoder.is_none()
                     || encoder
                         .as_ref()
@@ -131,7 +247,6 @@ pub fn run(config: SessionConfig) -> Result<()> {
                 let enc = encoder.as_mut().unwrap();
                 let expected_size = (w * h * 4) as usize;
 
-                // Skip if frame data doesn't match expected size
                 if frame.data.len() != expected_size {
                     tracing::warn!(
                         "Frame size mismatch: got {} expected {} ({}x{})",
@@ -157,10 +272,9 @@ pub fn run(config: SessionConfig) -> Result<()> {
             tracing::info!("Encoder thread exiting");
         })?;
 
-    // Start the decoder thread (reads incoming H264 from transport, writes to frame buffer)
-    let fb = frame_buffer.clone();
-    let decoder_conn_state = conn_state.clone();
-    let _decoder_handle = std::thread::Builder::new()
+    let fb = frame_buffer;
+    let decoder_conn_state = conn_state;
+    std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || {
             let mut decoder = match H264Decoder::new() {
@@ -176,18 +290,15 @@ pub fn run(config: SessionConfig) -> Result<()> {
             decoder_conn_state.set(ConnState::Connected);
 
             while let Some(raw_msg) = incoming_rx.blocking_recv() {
-                // Classify the message: video data, signaling, or pending
                 let h264_data = match reassembler.feed_classified(&raw_msg) {
                     IncomingMessage::VideoData(data) => data,
                     IncomingMessage::Signaling(json) => {
-                        // Route signaling messages to the reconnect monitor
                         let _ = signaling_tx.blocking_send(json);
                         continue;
                     }
                     IncomingMessage::Pending => continue,
                 };
 
-                // Reset reassembler if we were reconnecting and are now getting data again
                 if decoder_conn_state.get() == ConnState::Reconnecting {
                     reassembler.reset();
                 }
@@ -201,7 +312,7 @@ pub fn run(config: SessionConfig) -> Result<()> {
                             rgba,
                         });
                     }
-                    Ok(None) => {} // Incomplete frame, need more data
+                    Ok(None) => {}
                     Err(e) => {
                         tracing::warn!("Decode error: {e}");
                     }
@@ -209,22 +320,6 @@ pub fn run(config: SessionConfig) -> Result<()> {
             }
             tracing::info!("Decoder thread exiting");
         })?;
-
-    // Run the egui viewer on the main thread
-    let viewer = ViewerApp::new(frame_buffer, conn_state);
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Screen Share")
-            .with_inner_size([960.0, 540.0]),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Screen Share",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(viewer))),
-    )
-    .map_err(|e| anyhow::anyhow!("Viewer error: {e}"))?;
 
     Ok(())
 }

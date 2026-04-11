@@ -6,7 +6,6 @@ mod transport;
 mod viewer;
 
 use anyhow::Result;
-use std::io::Write;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -16,31 +15,19 @@ fn main() -> Result<()> {
         )
         .init();
 
-    println!("=== P2P Screen Share ===\n");
-
-    // 1. Get passphrase
-    let passphrase = rpassword::prompt_password("Enter passphrase: ")?;
-    anyhow::ensure!(!passphrase.is_empty(), "Passphrase cannot be empty");
-
-    // 2. Pick window to share
-    let window = capture::picker::pick_window_interactive()?;
-
-    // 3. Choose role
-    print!("\nCreate session (c) or Join session (j)? ");
-    std::io::stdout().flush()?;
-    let mut role_input = String::new();
-    std::io::stdin().read_line(&mut role_input)?;
-
-    let role = match role_input.trim().to_lowercase().as_str() {
-        "c" | "create" => app::Role::Offerer,
-        "j" | "join" => app::Role::Answerer,
-        other => anyhow::bail!("Unknown role: '{other}'. Use 'c' or 'j'."),
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Screen Share")
+            .with_inner_size([960.0, 540.0]),
+        ..Default::default()
     };
 
-    // 4. Run the app
-    app::run(app::SessionConfig {
-        passphrase,
-        window,
-        role,
-    })
+    eframe::run_native(
+        "Screen Share",
+        native_options,
+        Box::new(|_cc| Ok(Box::new(viewer::App::new()))),
+    )
+    .map_err(|e| anyhow::anyhow!("Viewer error: {e}"))?;
+
+    Ok(())
 }
