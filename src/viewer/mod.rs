@@ -227,7 +227,14 @@ impl App {
 
                 ui.add_space(12.0);
 
-                if ui.button("Start").clicked() {
+                if ui
+                    .scope(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
+                        ui.button("Start")
+                    })
+                    .inner
+                    .clicked()
+                {
                     self.handle_start();
                 }
             });
