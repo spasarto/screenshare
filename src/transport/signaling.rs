@@ -1,7 +1,4 @@
-use crate::crypto::Crypto;
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
@@ -35,20 +32,16 @@ impl SignalingBlob {
     }
 }
 
-pub fn encode_blob(sdp: &RTCSessionDescription, crypto: &Crypto) -> Result<String> {
+/// Encode an SDP to a JSON string (for server-relayed signaling).
+pub fn encode_sdp_json(sdp: &RTCSessionDescription) -> Result<String> {
     let blob = SignalingBlob::from_sdp(sdp);
-    let json = serde_json::to_vec(&blob).context("Failed to serialize SDP")?;
-    let encrypted = crypto.encrypt(&json)?;
-    Ok(BASE64.encode(&encrypted))
+    serde_json::to_string(&blob).context("Failed to serialize SDP to JSON")
 }
 
-pub fn decode_blob(encoded: &str, crypto: &Crypto) -> Result<RTCSessionDescription> {
-    let encrypted = BASE64
-        .decode(encoded.trim())
-        .context("Invalid base64 in signaling blob")?;
-    let json = crypto.decrypt(&encrypted)?;
-    let blob: SignalingBlob = serde_json::from_slice(&json).context("Failed to deserialize SDP")?;
-
+/// Decode an SDP from a JSON string (for server-relayed signaling).
+pub fn decode_sdp_json(json: &str) -> Result<RTCSessionDescription> {
+    let blob: SignalingBlob =
+        serde_json::from_str(json).context("Failed to deserialize SDP from JSON")?;
     blob_to_sdp(blob)
 }
 

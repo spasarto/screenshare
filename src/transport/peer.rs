@@ -1,5 +1,4 @@
 use crate::app::Role;
-use crate::crypto::Crypto;
 use crate::transport::signaling::{self, SignalingBlob};
 use crate::transport::{ConnState, SharedConnState};
 use anyhow::{Context, Result};
@@ -202,8 +201,8 @@ impl PeerConnection {
         self.signaling_tx.clone()
     }
 
-    /// Create an offer (offerer role). Returns the encrypted SDP blob.
-    pub async fn create_offer(&self, crypto: &Crypto) -> Result<String> {
+    /// Create an offer (offerer role). Returns the SDP as a JSON string.
+    pub async fn create_offer(&self) -> Result<String> {
         // Create data channel (offerer creates it, answerer receives it via on_data_channel)
         let dc = self
             .pc
@@ -240,12 +239,12 @@ impl PeerConnection {
             .await
             .context("No local description")?;
 
-        signaling::encode_blob(&local_desc, crypto)
+        signaling::encode_sdp_json(&local_desc)
     }
 
     /// Accept an offer and create an answer (answerer role).
-    pub async fn accept_offer(&self, offer_blob: &str, crypto: &Crypto) -> Result<String> {
-        let offer = signaling::decode_blob(offer_blob, crypto)?;
+    pub async fn accept_offer(&self, offer_json: &str) -> Result<String> {
+        let offer = signaling::decode_sdp_json(offer_json)?;
         self.pc.set_remote_description(offer).await?;
 
         let answer = self.pc.create_answer(None).await?;
@@ -259,12 +258,12 @@ impl PeerConnection {
             .await
             .context("No local description")?;
 
-        signaling::encode_blob(&local_desc, crypto)
+        signaling::encode_sdp_json(&local_desc)
     }
 
     /// Complete the connection (offerer sets the answer).
-    pub async fn set_answer(&self, answer_blob: &str, crypto: &Crypto) -> Result<()> {
-        let answer = signaling::decode_blob(answer_blob, crypto)?;
+    pub async fn set_answer(&self, answer_json: &str) -> Result<()> {
+        let answer = signaling::decode_sdp_json(answer_json)?;
         self.pc.set_remote_description(answer).await?;
         Ok(())
     }
@@ -307,9 +306,7 @@ async fn wait_for_ice_gathering_raw(pc: &RTCPeerConnection) {
     pc.on_ice_gathering_state_change(Box::new(move |state| {
         let tx = gather_tx.clone();
         Box::pin(async move {
-            if state
-                == webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete
-            {
+            if state == webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete {
                 let _ = tx.send(()).await;
             }
         })
@@ -420,12 +417,8 @@ pub fn spawn_reconnect_monitor(
             }
 
             let result = match role {
-                Role::Offerer => {
-                    ice_restart_offerer(&pc, &dc_holder, &mut signaling_rx).await
-                }
-                Role::Answerer => {
-                    ice_restart_answerer(&pc, &dc_holder, &mut signaling_rx).await
-                }
+                Role::Offerer => ice_restart_offerer(&pc, &dc_holder, &mut signaling_rx).await,
+                Role::Answerer => ice_restart_answerer(&pc, &dc_holder, &mut signaling_rx).await,
             };
 
             match result {

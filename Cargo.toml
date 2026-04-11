@@ -10,18 +10,14 @@ openh264 = "0.9"
 eframe = "0.33"
 egui = "0.33"
 windows-capture = "1.5"
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-rpassword = "7"
 bytes = "1"
-rand = "0.8"
-dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]

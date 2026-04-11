@@ -1,21 +1,35 @@
 mod app;
 mod capture;
 mod codec;
-mod crypto;
+mod signaling_server;
 mod transport;
-mod turn;
 mod viewer;
 
 use anyhow::Result;
+use clap::Parser;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "screenshare", about = "Peer-to-peer screen sharing")]
+pub struct CliArgs {
+    /// Start in server mode (create session)
+    #[arg(long, conflicts_with = "client")]
+    pub server: bool,
+
+    /// Start in client mode (join session)
+    #[arg(long, conflicts_with = "server")]
+    pub client: bool,
+
+    /// Process name to wait for and share (substring match, case-insensitive)
+    #[arg(long)]
+    pub process: Option<String>,
+
+    /// 6-digit session pin. Server: use this pin instead of generating one. Client: connect to this pin.
+    #[arg(long)]
+    pub pin: Option<String>,
+}
 
 fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-
-    // Validate required TURN environment variables early.
-    for var in ["TURN_TOKEN_ID", "TURN_API_TOKEN"] {
-        std::env::var(var)
-            .map_err(|_| anyhow::anyhow!("{var} environment variable must be set (check .env)"))?;
-    }
+    let args = CliArgs::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -23,6 +37,13 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Validate pin format if provided
+    if let Some(ref pin) = args.pin {
+        if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!("Pin must be exactly 6 digits (e.g. 123456)");
+        }
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -34,7 +55,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Screen Share",
         native_options,
-        Box::new(|_cc| Ok(Box::new(viewer::App::new()))),
+        Box::new(move |_cc| Ok(Box::new(viewer::App::new(args)))),
     )
     .map_err(|e| anyhow::anyhow!("Viewer error: {e}"))?;
 

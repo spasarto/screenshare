@@ -1,9 +1,11 @@
 use crate::app::SessionEvent;
 use crate::capture::picker::{self, WindowInfo};
 use crate::transport::{ConnState, SharedConnState};
-use crate::turn::TurnConfig;
+use crate::CliArgs;
 use egui::TextureHandle;
 use std::sync::{Arc, Mutex};
+
+const SERVER_URL: &str = "https://screenshare.aghj.dev";
 
 pub struct DecodedFrame {
     pub width: u32,
@@ -20,12 +22,10 @@ enum Role {
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Setup,
-    GeneratingOffer,
-    OfferReady,
-    AwaitingOffer,
-    GeneratingAnswer,
-    AnswerReady,
-    Connecting,
+    WaitingForProcess,
+    CreatingSession,
+    WaitingForPeer,
+    Joining,
     Viewing,
     Error,
 }
@@ -34,55 +34,72 @@ pub struct App {
     phase: Phase,
 
     // Setup
-    passphrase: String,
     windows: Vec<WindowInfo>,
     selected_window: Option<usize>,
     role: Role,
+    session_code: String,
     setup_error: Option<String>,
 
-    // Signaling
-    local_code: String,
-    remote_code_input: String,
-    copied: bool,
-
-    // Held for answerer (moved to background thread on connect)
-    held_window: Option<windows_capture::window::Window>,
-    held_passphrase: Option<String>,
+    // CLI auto-start
+    cli_process: Option<String>,
+    cli_pin: Option<String>,
+    last_process_poll: Option<std::time::Instant>,
 
     // Background communication
     event_rx: Option<std::sync::mpsc::Receiver<SessionEvent>>,
-    answer_tx: Option<std::sync::mpsc::Sender<String>>,
 
     // Viewing
     frame_buffer: Option<Arc<Mutex<Option<DecodedFrame>>>>,
     texture: Option<TextureHandle>,
     conn_state: Option<SharedConnState>,
+    copied: bool,
 
     // Error
     error_message: String,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(args: CliArgs) -> Self {
         let windows = picker::enumerate_windows().unwrap_or_default();
         let has_windows = !windows.is_empty();
+
+        // Determine role from CLI flags, defaulting to Create
+        let role = if args.client {
+            Role::Join
+        } else {
+            Role::Create
+        };
+
+        // Pre-fill session code from --pin for client mode
+        let session_code = if args.client {
+            args.pin.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Decide starting phase: if we have a role flag + process, wait for process
+        let has_role = args.server || args.client;
+        let phase = if has_role && args.process.is_some() {
+            Phase::WaitingForProcess
+        } else {
+            Phase::Setup
+        };
+
         Self {
-            phase: Phase::Setup,
-            passphrase: "zelda".to_string(),
+            phase,
             windows,
             selected_window: if has_windows { Some(0) } else { None },
-            role: Role::Create,
+            role,
+            session_code,
             setup_error: None,
-            local_code: String::new(),
-            remote_code_input: String::new(),
-            copied: false,
-            held_window: None,
-            held_passphrase: None,
+            cli_process: args.process,
+            cli_pin: if args.server { args.pin } else { None },
+            last_process_poll: None,
             event_rx: None,
-            answer_tx: None,
             frame_buffer: None,
             texture: None,
             conn_state: None,
+            copied: false,
             error_message: String::new(),
         }
     }
@@ -92,13 +109,9 @@ impl App {
 
         while let Ok(event) = rx.try_recv() {
             match event {
-                SessionEvent::OfferReady(offer) => {
-                    self.local_code = offer;
-                    self.phase = Phase::OfferReady;
-                }
-                SessionEvent::AnswerReady(answer) => {
-                    self.local_code = answer;
-                    self.phase = Phase::AnswerReady;
+                SessionEvent::SessionCode(code) => {
+                    self.session_code = code;
+                    self.phase = Phase::WaitingForPeer;
                 }
                 SessionEvent::SessionReady {
                     frame_buffer,
@@ -106,10 +119,7 @@ impl App {
                 } => {
                     self.frame_buffer = Some(frame_buffer);
                     self.conn_state = Some(conn_state);
-                    // If answerer is still showing their response code, stay there
-                    if self.phase != Phase::AnswerReady {
-                        self.phase = Phase::Viewing;
-                    }
+                    self.phase = Phase::Viewing;
                 }
                 SessionEvent::Error(msg) => {
                     self.error_message = msg;
@@ -127,17 +137,6 @@ impl App {
                 ui.add_space(20.0);
 
                 ui.set_max_width(450.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Passphrase:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.passphrase)
-                            .password(true)
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-
-                ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
                     ui.label("Window:");
@@ -181,6 +180,18 @@ impl App {
                     ui.radio_value(&mut self.role, Role::Join, "Join session");
                 });
 
+                if self.role == Role::Join {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Session code:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.session_code)
+                                .desired_width(120.0)
+                                .hint_text("e.g. 482917"),
+                        );
+                    });
+                }
+
                 if let Some(err) = &self.setup_error {
                     ui.add_space(4.0);
                     ui.colored_label(egui::Color32::RED, err.clone());
@@ -196,11 +207,6 @@ impl App {
     }
 
     fn handle_start(&mut self) {
-        if self.passphrase.is_empty() {
-            self.setup_error = Some("Passphrase is required".into());
-            return;
-        }
-
         let Some(idx) = self.selected_window else {
             self.setup_error = Some("Select a window to share".into());
             return;
@@ -211,197 +217,136 @@ impl App {
             return;
         }
 
-        let passphrase = self.passphrase.clone();
         let windows = std::mem::take(&mut self.windows);
         let window = windows.into_iter().nth(idx).unwrap().window;
 
         match self.role {
             Role::Create => {
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
-                let (answer_tx, answer_rx) = std::sync::mpsc::channel();
-
                 self.event_rx = Some(event_rx);
-                self.answer_tx = Some(answer_tx);
 
-                let turn = TurnConfig::from_env().expect("TURN env vars must be set");
-                crate::app::spawn_offerer(passphrase, window, turn, event_tx, answer_rx);
-                self.phase = Phase::GeneratingOffer;
+                crate::app::spawn_offerer(SERVER_URL.to_string(), window, self.cli_pin.clone(), event_tx);
+                self.phase = Phase::CreatingSession;
             }
             Role::Join => {
-                self.held_window = Some(window);
-                self.held_passphrase = Some(passphrase);
-                self.phase = Phase::AwaitingOffer;
+                let code = self.session_code.trim().to_string();
+                if code.is_empty() {
+                    self.setup_error = Some("Enter a session code".into());
+                    // Put windows back
+                    self.windows = picker::enumerate_windows().unwrap_or_default();
+                    return;
+                }
+
+                let (event_tx, event_rx) = std::sync::mpsc::channel();
+                self.event_rx = Some(event_rx);
+
+                crate::app::spawn_answerer(SERVER_URL.to_string(), window, code, event_tx);
+                self.phase = Phase::Joining;
             }
         }
     }
 
-    fn show_generating(&self, ctx: &egui::Context) {
+    /// Auto-start a session directly with a found window (used by WaitingForProcess phase).
+    fn start_with_window(&mut self, window: windows_capture::window::Window) {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        self.event_rx = Some(event_rx);
+
+        match self.role {
+            Role::Create => {
+                crate::app::spawn_offerer(SERVER_URL.to_string(), window, self.cli_pin.clone(), event_tx);
+                self.phase = Phase::CreatingSession;
+            }
+            Role::Join => {
+                let code = self.session_code.trim().to_string();
+                crate::app::spawn_answerer(SERVER_URL.to_string(), window, code, event_tx);
+                self.phase = Phase::Joining;
+            }
+        }
+    }
+
+    fn show_creating_session(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
                 ui.spinner();
                 ui.add_space(10.0);
-                ui.label("Generating connection code...");
+                ui.label("Creating session...");
             });
         });
     }
 
-    fn show_offer_ready(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(20.0);
-                    ui.heading("Your Connection Code");
-                    ui.add_space(10.0);
+    fn show_waiting_for_process(&mut self, ctx: &egui::Context) {
+        let process_name = self.cli_process.clone().unwrap_or_default();
 
-                    ui.set_max_width(550.0);
+        // Poll for the process every ~1 second
+        let should_poll = self
+            .last_process_poll
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+            .unwrap_or(true);
 
-                    ui.label("Send this code to your peer:");
-                    ui.add_space(4.0);
+        if should_poll {
+            self.last_process_poll = Some(std::time::Instant::now());
+            if let Some(info) = picker::find_window_by_process(&process_name) {
+                tracing::info!("Found process '{}': window '{}'", process_name, info.title);
+                self.start_with_window(info.window);
+                return;
+            }
+        }
 
-                    let mut code = self.local_code.clone();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut code)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
-
-                    ui.horizontal(|ui| {
-                        if ui.button("📋 Copy").clicked() {
-                            ui.ctx().copy_text(self.local_code.clone());
-                            self.copied = true;
-                        }
-                        if self.copied {
-                            ui.colored_label(egui::Color32::GREEN, "✓ Copied!");
-                        }
-                    });
-
-                    ui.add_space(16.0);
-                    ui.label("Paste their response code below:");
-                    ui.add_space(4.0);
-
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.remote_code_input)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("Paste response code here..."),
-                    );
-
-                    ui.add_space(8.0);
-                    let can_connect = !self.remote_code_input.trim().is_empty();
-                    ui.add_enabled_ui(can_connect, |ui| {
-                        if ui.button("Connect").clicked() {
-                            if let Some(tx) = &self.answer_tx {
-                                let _ = tx.send(self.remote_code_input.trim().to_string());
-                            }
-                            self.answer_tx = None;
-                            self.phase = Phase::Connecting;
-                        }
-                    });
-                });
-            });
-        });
-    }
-
-    fn show_awaiting_offer(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.heading("Join Session");
-                ui.add_space(16.0);
-
-                ui.set_max_width(550.0);
-
-                ui.label("Paste the connection code from your peer:");
-                ui.add_space(4.0);
-
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.remote_code_input)
-                        .desired_rows(5)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("Paste connection code here..."),
-                );
-
-                ui.add_space(8.0);
-                let can_connect = !self.remote_code_input.trim().is_empty();
-                ui.add_enabled_ui(can_connect, |ui| {
-                    if ui.button("Connect").clicked() {
-                        let window = self.held_window.take().expect("window should be held");
-                        let passphrase = self
-                            .held_passphrase
-                            .take()
-                            .expect("passphrase should be held");
-                        let offer = self.remote_code_input.trim().to_string();
-
-                        let (event_tx, event_rx) = std::sync::mpsc::channel();
-                        self.event_rx = Some(event_rx);
-
-                        let turn = TurnConfig::from_env().expect("TURN env vars must be set");
-                        crate::app::spawn_answerer(passphrase, window, offer, turn, event_tx);
-                        self.phase = Phase::GeneratingAnswer;
-                    }
-                });
-            });
-        });
-    }
-
-    fn show_answer_ready(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.heading("Your Response Code");
+                ui.add_space(100.0);
+                ui.spinner();
                 ui.add_space(10.0);
+                ui.label(format!("Waiting for '{}' to start...", process_name));
+            });
+        });
+    }
 
-                ui.set_max_width(550.0);
+    fn show_waiting_for_peer(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                ui.heading("Session Created");
+                ui.add_space(20.0);
 
-                ui.label("Send this code back to your peer:");
-                ui.add_space(4.0);
+                ui.label("Share this code with your peer:");
+                ui.add_space(12.0);
 
-                let mut code = self.local_code.clone();
-                ui.add(
-                    egui::TextEdit::multiline(&mut code)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
+                ui.label(
+                    egui::RichText::new(&self.session_code)
+                        .size(48.0)
+                        .monospace()
+                        .strong(),
                 );
 
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy").clicked() {
-                        ui.ctx().copy_text(self.local_code.clone());
+                        ui.ctx().copy_text(self.session_code.clone());
                         self.copied = true;
                     }
                     if self.copied {
-                        ui.colored_label(egui::Color32::GREEN, "✓ Copied!");
+                        ui.colored_label(egui::Color32::GREEN, "Copied!");
                     }
                 });
 
-                ui.add_space(16.0);
-
-                let session_ready = self.frame_buffer.is_some();
-                if session_ready {
-                    if ui.button("Continue to Viewer").clicked() {
-                        self.phase = Phase::Viewing;
-                    }
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Setting up session...");
-                    });
-                }
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Waiting for peer to join...");
+                });
             });
         });
     }
 
-    fn show_connecting(&self, ctx: &egui::Context) {
+    fn show_joining(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
                 ui.spinner();
                 ui.add_space(10.0);
-                ui.label("Connecting...");
+                ui.label("Joining session...");
             });
         });
     }
@@ -502,11 +447,10 @@ impl eframe::App for App {
 
         match self.phase {
             Phase::Setup => self.show_setup(ctx),
-            Phase::GeneratingOffer | Phase::GeneratingAnswer => self.show_generating(ctx),
-            Phase::OfferReady => self.show_offer_ready(ctx),
-            Phase::AwaitingOffer => self.show_awaiting_offer(ctx),
-            Phase::AnswerReady => self.show_answer_ready(ctx),
-            Phase::Connecting => self.show_connecting(ctx),
+            Phase::WaitingForProcess => self.show_waiting_for_process(ctx),
+            Phase::CreatingSession => self.show_creating_session(ctx),
+            Phase::WaitingForPeer => self.show_waiting_for_peer(ctx),
+            Phase::Joining => self.show_joining(ctx),
             Phase::Viewing => self.show_viewing(ctx),
             Phase::Error => self.show_error(ctx),
         }

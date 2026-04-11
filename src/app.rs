@@ -1,10 +1,9 @@
 use crate::capture;
 use crate::codec::{H264Decoder, H264Encoder};
-use crate::crypto::Crypto;
+use crate::signaling_server::SignalingServer;
 use crate::transport::framing::IncomingMessage;
 use crate::transport::peer::{self, PeerConnection};
 use crate::transport::{ConnState, SharedConnState};
-use crate::turn::TurnConfig;
 use crate::viewer::DecodedFrame;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -22,8 +21,8 @@ pub enum Role {
 }
 
 pub enum SessionEvent {
-    OfferReady(String),
-    AnswerReady(String),
+    /// Offerer: session created, here's the 6-digit code to share.
+    SessionCode(String),
     SessionReady {
         frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
         conn_state: SharedConnState,
@@ -33,16 +32,15 @@ pub enum SessionEvent {
 
 /// Spawn the offerer session in a background thread.
 pub fn spawn_offerer(
-    passphrase: String,
+    server_url: String,
     window: Window,
-    turn: TurnConfig,
+    custom_pin: Option<String>,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
-    answer_rx: std::sync::mpsc::Receiver<String>,
 ) {
     std::thread::Builder::new()
         .name("session-offerer".into())
         .spawn(move || {
-            if let Err(e) = run_offerer(passphrase, window, turn, &event_tx, answer_rx) {
+            if let Err(e) = run_offerer(server_url, window, custom_pin.as_deref(), &event_tx) {
                 let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
             }
         })
@@ -51,16 +49,15 @@ pub fn spawn_offerer(
 
 /// Spawn the answerer session in a background thread.
 pub fn spawn_answerer(
-    passphrase: String,
+    server_url: String,
     window: Window,
-    offer: String,
-    turn: TurnConfig,
+    session_code: String,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
 ) {
     std::thread::Builder::new()
         .name("session-answerer".into())
         .spawn(move || {
-            if let Err(e) = run_answerer(passphrase, window, &offer, turn, &event_tx) {
+            if let Err(e) = run_answerer(server_url, window, &session_code, &event_tx) {
                 let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
             }
         })
@@ -68,13 +65,11 @@ pub fn spawn_answerer(
 }
 
 fn run_offerer(
-    passphrase: String,
+    server_url: String,
     window: Window,
-    turn: TurnConfig,
+    custom_pin: Option<&str>,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
-    answer_rx: std::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
-    let crypto = Crypto::from_passphrase(&passphrase)?;
     let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
     let conn_state = SharedConnState::new();
 
@@ -85,20 +80,25 @@ fn run_offerer(
     let _rt = tokio::runtime::Runtime::new()?;
 
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
-        let ice_servers = turn.fetch_ice_servers().await?;
+        let server = SignalingServer::new(&server_url);
+
+        // Create session and get ICE servers from the signaling server
+        let (code, ice_servers) = server.create_session(custom_pin).await?;
+
         let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
-        let offer_blob = peer.create_offer(&crypto).await?;
+        let offer_json = peer.create_offer().await?;
 
+        // Upload offer SDP to the signaling server
+        server.upload_offer(&code, &offer_json).await?;
+
+        // Tell the GUI the session code so the user can share it
         event_tx
-            .send(SessionEvent::OfferReady(offer_blob))
+            .send(SessionEvent::SessionCode(code.clone()))
             .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
 
-        // Block until the GUI sends the answer
-        let answer = answer_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
-
-        peer.set_answer(&answer, &crypto).await?;
+        // Poll for the answer from the remote peer
+        let answer_json = server.poll_answer(&code).await?;
+        peer.set_answer(&answer_json).await?;
 
         let dc_holder = peer.data_channel();
         let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");
@@ -146,13 +146,11 @@ fn run_offerer(
 }
 
 fn run_answerer(
-    passphrase: String,
+    server_url: String,
     window: Window,
-    offer: &str,
-    turn: TurnConfig,
+    session_code: &str,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
-    let crypto = Crypto::from_passphrase(&passphrase)?;
     let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
     let conn_state = SharedConnState::new();
 
@@ -163,13 +161,19 @@ fn run_answerer(
     let _rt = tokio::runtime::Runtime::new()?;
 
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
-        let ice_servers = turn.fetch_ice_servers().await?;
-        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
-        let answer_blob = peer.accept_offer(offer, &crypto).await?;
+        let server = SignalingServer::new(&server_url);
 
-        event_tx
-            .send(SessionEvent::AnswerReady(answer_blob))
-            .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
+        // Join the session and get ICE servers
+        let ice_servers = server.join_session(session_code).await?;
+
+        // Poll for the offer from the remote peer
+        let offer_json = server.poll_offer(session_code).await?;
+
+        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
+        let answer_json = peer.accept_offer(&offer_json).await?;
+
+        // Upload our answer to the signaling server
+        server.upload_answer(session_code, &answer_json).await?;
 
         let dc_holder = peer.data_channel();
         let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");
