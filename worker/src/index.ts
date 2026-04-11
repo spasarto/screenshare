@@ -12,7 +12,7 @@ interface Session {
 const SESSION_TTL = 300; // 5 minutes
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
@@ -196,6 +196,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       return json({ ready: false }, 200);
     }
     return json({ ready: true, answer: session.answer });
+  }
+
+  // DELETE /api/session/:code — remove a session (called by the host on exit)
+  if (sub === "" && request.method === "DELETE") {
+    await env.SESSIONS.delete(code);
+    return json({ ok: true });
   }
 
   return err("Not found", 404);

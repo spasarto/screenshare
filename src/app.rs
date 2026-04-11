@@ -163,8 +163,8 @@ fn run_answerer(
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
         let server = SignalingServer::new(&server_url);
 
-        // Join the session and get ICE servers
-        let ice_servers = server.join_session(session_code).await?;
+        // Join the session, polling until it exists (handles client starting before server)
+        let ice_servers = server.join_session_polling(session_code).await?;
 
         // Poll for the offer from the remote peer
         let offer_json = server.poll_offer(session_code).await?;
@@ -219,6 +219,7 @@ fn run_answerer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_media_threads(
     window: Window,
     capture_tx: std::sync::mpsc::SyncSender<capture::Frame>,
@@ -258,7 +259,7 @@ fn start_media_threads(
                 let enc = encoder.as_mut().unwrap();
                 let expected_size = (w * h * 4) as usize;
 
-                if frame.data.len() != expected_size {
+                if frame.data.len() < expected_size {
                     tracing::warn!(
                         "Frame size mismatch: got {} expected {} ({}x{})",
                         frame.data.len(),
@@ -269,7 +270,7 @@ fn start_media_threads(
                     continue;
                 }
 
-                match enc.encode(&frame.data) {
+                match enc.encode(&frame.data[..expected_size]) {
                     Ok(h264_data) => {
                         if !h264_data.is_empty() {
                             let _ = encoded_tx.blocking_send(h264_data);

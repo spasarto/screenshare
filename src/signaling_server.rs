@@ -51,7 +51,6 @@ fn to_rtc_servers(entries: Vec<IceServerEntry>) -> Vec<RTCIceServer> {
             urls: e.urls,
             username: e.username.unwrap_or_default(),
             credential: e.credential.unwrap_or_default(),
-            ..Default::default()
         })
         .collect()
 }
@@ -101,28 +100,44 @@ impl SignalingServer {
         Ok((parsed.code, to_rtc_servers(parsed.ice_servers)))
     }
 
-    /// Join an existing session. Returns ICE servers.
-    pub async fn join_session(&self, code: &str) -> Result<Vec<RTCIceServer>> {
+    /// Join a session, polling until it appears on the signaling server.
+    /// This handles the case where the client launches before the server has created
+    /// the session — retries on 404 until the session exists or the timeout elapses.
+    pub async fn join_session_polling(&self, code: &str) -> Result<Vec<RTCIceServer>> {
         let url = format!("{}/api/session/{}", self.base_url, code);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to contact signaling server")?;
+        let start = std::time::Instant::now();
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Join session failed ({status}): {body}");
+        loop {
+            if start.elapsed() > POLL_TIMEOUT {
+                anyhow::bail!("Timed out waiting for session to be created");
+            }
+
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to contact signaling server")?;
+
+            if resp.status().as_u16() == 404 {
+                tracing::info!("Session {code} not found yet, retrying...");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Join session failed ({status}): {body}");
+            }
+
+            let parsed: JoinSessionResponse = resp
+                .json()
+                .await
+                .context("Failed to parse join session response")?;
+
+            return Ok(to_rtc_servers(parsed.ice_servers));
         }
-
-        let parsed: JoinSessionResponse = resp
-            .json()
-            .await
-            .context("Failed to parse join session response")?;
-
-        Ok(to_rtc_servers(parsed.ice_servers))
     }
 
     /// Upload the offer SDP to the session.
@@ -228,6 +243,17 @@ impl SignalingServer {
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Delete a session from the signaling server (blocking, for use on app exit).
+    pub fn delete_session_blocking(&self, code: &str) {
+        let url = format!("{}/api/session/{}", self.base_url, code);
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            let _ = client.delete(&url).send();
         }
     }
 }

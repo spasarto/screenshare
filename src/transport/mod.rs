@@ -30,7 +30,6 @@ impl ConnState {
 #[derive(Clone, Debug)]
 pub struct IceInfo {
     pub local_type: String,
-    pub remote_type: String,
     pub relay: bool,
 }
 

@@ -52,14 +52,19 @@ pub struct App {
     frame_buffer: Option<Arc<Mutex<Option<DecodedFrame>>>>,
     texture: Option<TextureHandle>,
     conn_state: Option<SharedConnState>,
-    copied: bool,
+
+    // Logo
+    logo_texture: Option<TextureHandle>,
+
+    // Cleanup: set when we are the offerer and have a session code
+    hosted_session_code: Option<String>,
 
     // Error
     error_message: String,
 }
 
 impl App {
-    pub fn new(args: CliArgs) -> Self {
+    pub fn new(args: CliArgs, cc: &eframe::CreationContext) -> Self {
         let windows = picker::enumerate_windows().unwrap_or_default();
         let has_windows = !windows.is_empty();
 
@@ -85,6 +90,20 @@ impl App {
             Phase::Setup
         };
 
+        let logo_texture = {
+            let bytes = include_bytes!("../logo.png");
+            let img = image::load_from_memory(bytes)
+                .expect("Failed to load logo.png")
+                .to_rgba8();
+            let (w, h) = img.dimensions();
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            Some(
+                cc.egui_ctx
+                    .load_texture("logo", color_image, egui::TextureOptions::LINEAR),
+            )
+        };
+
         Self {
             phase,
             windows,
@@ -99,7 +118,8 @@ impl App {
             frame_buffer: None,
             texture: None,
             conn_state: None,
-            copied: false,
+            logo_texture,
+            hosted_session_code: None,
             error_message: String::new(),
         }
     }
@@ -110,6 +130,7 @@ impl App {
         while let Ok(event) = rx.try_recv() {
             match event {
                 SessionEvent::SessionCode(code) => {
+                    self.hosted_session_code = Some(code.clone());
                     self.session_code = code;
                     self.phase = Phase::WaitingForPeer;
                 }
@@ -129,12 +150,19 @@ impl App {
         }
     }
 
+    fn show_logo(&self, ui: &mut egui::Ui) {
+        if let Some(tex) = &self.logo_texture {
+            let size = egui::vec2(72.0, 72.0);
+            ui.image(egui::load::SizedTexture::new(tex.id(), size));
+        }
+    }
+
     fn show_setup(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.heading("Screen Share");
-                ui.add_space(20.0);
+                ui.add_space(30.0);
+                self.show_logo(ui);
+                ui.add_space(12.0);
 
                 ui.set_max_width(450.0);
 
@@ -225,7 +253,12 @@ impl App {
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 self.event_rx = Some(event_rx);
 
-                crate::app::spawn_offerer(SERVER_URL.to_string(), window, self.cli_pin.clone(), event_tx);
+                crate::app::spawn_offerer(
+                    SERVER_URL.to_string(),
+                    window,
+                    self.cli_pin.clone(),
+                    event_tx,
+                );
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
@@ -253,7 +286,12 @@ impl App {
 
         match self.role {
             Role::Create => {
-                crate::app::spawn_offerer(SERVER_URL.to_string(), window, self.cli_pin.clone(), event_tx);
+                crate::app::spawn_offerer(
+                    SERVER_URL.to_string(),
+                    window,
+                    self.cli_pin.clone(),
+                    event_tx,
+                );
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
@@ -267,7 +305,9 @@ impl App {
     fn show_creating_session(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
+                ui.add_space(60.0);
+                self.show_logo(ui);
+                ui.add_space(40.0);
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label("Creating session...");
@@ -295,7 +335,9 @@ impl App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
+                ui.add_space(60.0);
+                self.show_logo(ui);
+                ui.add_space(40.0);
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label(format!("Waiting for '{}' to start...", process_name));
@@ -306,7 +348,9 @@ impl App {
     fn show_waiting_for_peer(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
+                ui.add_space(30.0);
+                self.show_logo(ui);
+                ui.add_space(20.0);
                 ui.heading("Session Created");
                 ui.add_space(20.0);
 
@@ -320,22 +364,10 @@ impl App {
                         .strong(),
                 );
 
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("📋 Copy").clicked() {
-                        ui.ctx().copy_text(self.session_code.clone());
-                        self.copied = true;
-                    }
-                    if self.copied {
-                        ui.colored_label(egui::Color32::GREEN, "Copied!");
-                    }
-                });
-
                 ui.add_space(20.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Waiting for peer to join...");
-                });
+                ui.spinner();
+                ui.add_space(10.0);
+                ui.label("Waiting for peer to join...");
             });
         });
     }
@@ -343,7 +375,9 @@ impl App {
     fn show_joining(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
+                ui.add_space(60.0);
+                self.show_logo(ui);
+                ui.add_space(40.0);
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label("Joining session...");
@@ -432,7 +466,9 @@ impl App {
     fn show_error(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
+                ui.add_space(60.0);
+                self.show_logo(ui);
+                ui.add_space(30.0);
                 ui.colored_label(egui::Color32::RED, "Error");
                 ui.add_space(10.0);
                 ui.label(&self.error_message);
@@ -444,6 +480,10 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
+
+        if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
+            crate::console::toggle();
+        }
 
         match self.phase {
             Phase::Setup => self.show_setup(ctx),
@@ -463,6 +503,13 @@ impl eframe::App for App {
             _ => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(code) = &self.hosted_session_code {
+            let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
+            server.delete_session_blocking(code);
         }
     }
 }

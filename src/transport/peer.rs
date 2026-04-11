@@ -119,7 +119,6 @@ impl PeerConnection {
                             );
                             state.set_ice_info(super::IceInfo {
                                 local_type,
-                                remote_type,
                                 relay,
                             });
                         }

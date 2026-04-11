@@ -1,6 +1,9 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod capture;
 mod codec;
+mod console;
 mod signaling_server;
 mod transport;
 mod viewer;
@@ -45,17 +48,31 @@ fn main() -> Result<()> {
         }
     }
 
+    let icon = {
+        let bytes = include_bytes!("logo.png");
+        let img = image::load_from_memory(bytes)
+            .expect("Failed to load logo.png")
+            .to_rgba8();
+        let (width, height) = img.dimensions();
+        egui::viewport::IconData {
+            rgba: img.into_raw(),
+            width,
+            height,
+        }
+    };
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Screen Share")
-            .with_inner_size([960.0, 540.0]),
+            .with_inner_size([960.0, 540.0])
+            .with_icon(icon),
         ..Default::default()
     };
 
     eframe::run_native(
         "Screen Share",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(viewer::App::new(args)))),
+        Box::new(move |cc| Ok(Box::new(viewer::App::new(args, cc)))),
     )
     .map_err(|e| anyhow::anyhow!("Viewer error: {e}"))?;
 
