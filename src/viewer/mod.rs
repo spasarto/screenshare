@@ -1,3 +1,4 @@
+use crate::transport::{ConnState, SharedConnState};
 use egui::TextureHandle;
 use std::sync::{Arc, Mutex};
 
@@ -10,18 +11,18 @@ pub struct DecodedFrame {
 pub struct ViewerApp {
     frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
     texture: Option<TextureHandle>,
-    connected: Arc<std::sync::atomic::AtomicBool>,
+    conn_state: SharedConnState,
 }
 
 impl ViewerApp {
     pub fn new(
         frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
-        connected: Arc<std::sync::atomic::AtomicBool>,
+        conn_state: SharedConnState,
     ) -> Self {
         Self {
             frame_buffer,
             texture: None,
-            connected,
+            conn_state,
         }
     }
 }
@@ -43,21 +44,26 @@ impl eframe::App for ViewerApp {
             match &mut self.texture {
                 Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
                 None => {
-                    self.texture = Some(ctx.load_texture("remote_screen", image, egui::TextureOptions::LINEAR));
+                    self.texture = Some(ctx.load_texture(
+                        "remote_screen",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
                 }
             }
         }
 
-        let connected = self
-            .connected
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let state = self.conn_state.get();
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let (color, text) = if connected {
-                    (egui::Color32::GREEN, "Connected")
-                } else {
-                    (egui::Color32::YELLOW, "Connecting...")
+                let (color, text) = match state {
+                    ConnState::Connected => (egui::Color32::GREEN, "Connected"),
+                    ConnState::Reconnecting => {
+                        (egui::Color32::from_rgb(255, 165, 0), "Reconnecting...")
+                    }
+                    ConnState::Failed => (egui::Color32::RED, "Disconnected"),
+                    ConnState::Connecting => (egui::Color32::YELLOW, "Connecting..."),
                 };
                 ui.colored_label(color, text);
             });

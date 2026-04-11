@@ -5,10 +5,31 @@
 /// large messages into chunks and reassembles them on the receiving end.
 ///
 /// Protocol (data channels are ordered + reliable by default):
-/// - Single message:  [0x00][4-byte BE total_len][payload]
-/// - Chunked start:   [0x01][4-byte BE total_len]
-/// - Chunked data:    [0x02][chunk_payload]
+/// - Single message:    [0x00][4-byte BE total_len][payload]
+/// - Chunked start:     [0x01][4-byte BE total_len]
+/// - Chunked data:      [0x02][chunk_payload]
+/// - Signaling message: [0x03][payload]  (JSON-serialized SignalingBlob)
 const MAX_CHUNK_PAYLOAD: usize = 15000; // Well under 16KB SCTP limit
+
+pub const MSG_SIGNALING: u8 = 0x03;
+
+/// Encode a signaling payload (JSON bytes) into a framed message.
+pub fn encode_signaling(json: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(1 + json.len());
+    msg.push(MSG_SIGNALING);
+    msg.extend_from_slice(json);
+    msg
+}
+
+/// Incoming message classification.
+pub enum IncomingMessage {
+    /// Video data (complete reassembled frame)
+    VideoData(Vec<u8>),
+    /// Signaling message (raw JSON bytes)
+    Signaling(Vec<u8>),
+    /// More chunks needed, or invalid
+    Pending,
+}
 
 /// Split a message into data channel frames.
 pub fn encode_chunked(data: &[u8]) -> Vec<Vec<u8>> {
@@ -55,6 +76,13 @@ impl Reassembler {
             buffer: Vec::new(),
             active: false,
         }
+    }
+
+    /// Reset reassembly state, discarding any partial message.
+    pub fn reset(&mut self) {
+        self.expected = 0;
+        self.buffer.clear();
+        self.active = false;
     }
 
     /// Feed a raw data channel message. Returns `Some(complete_message)` when
@@ -104,6 +132,20 @@ impl Reassembler {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Feed a raw message and classify it as video data, signaling, or pending.
+    pub fn feed_classified(&mut self, msg: &[u8]) -> IncomingMessage {
+        if msg.is_empty() {
+            return IncomingMessage::Pending;
+        }
+        if msg[0] == MSG_SIGNALING {
+            return IncomingMessage::Signaling(msg[1..].to_vec());
+        }
+        match self.feed(msg) {
+            Some(data) => IncomingMessage::VideoData(data),
+            None => IncomingMessage::Pending,
         }
     }
 }

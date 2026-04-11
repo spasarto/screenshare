@@ -1,10 +1,11 @@
 use crate::capture;
 use crate::codec::{H264Decoder, H264Encoder};
 use crate::crypto::Crypto;
+use crate::transport::framing::IncomingMessage;
 use crate::transport::peer::{self, PeerConnection};
+use crate::transport::{ConnState, SharedConnState};
 use crate::viewer::{DecodedFrame, ViewerApp};
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use windows_capture::window::Window;
@@ -13,6 +14,7 @@ const TARGET_WIDTH: u32 = 1280;
 const TARGET_HEIGHT: u32 = 720;
 const FRAME_CHANNEL_SIZE: usize = 4;
 
+#[derive(Clone, Copy)]
 pub enum Role {
     Offerer,
     Answerer,
@@ -29,7 +31,7 @@ pub fn run(config: SessionConfig) -> Result<()> {
 
     // Frame buffer shared between decoder thread and egui viewer
     let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
-    let connected = Arc::new(AtomicBool::new(false));
+    let conn_state = SharedConnState::new();
 
     // Capture → Encoder channel (std sync, both are OS threads)
     let (capture_tx, capture_rx) =
@@ -41,9 +43,11 @@ pub fn run(config: SessionConfig) -> Result<()> {
     // Build the tokio runtime for async WebRTC work
     let rt = tokio::runtime::Runtime::new()?;
 
+    let role = config.role;
+
     // Do signaling in the runtime
-    let (_dc_holder, incoming_rx) = rt.block_on(async {
-        let mut peer = PeerConnection::new().await?;
+    let (_dc_holder, incoming_rx, signaling_tx) = rt.block_on(async {
+        let mut peer = PeerConnection::new(conn_state.clone()).await?;
 
         match config.role {
             Role::Offerer => {
@@ -72,11 +76,23 @@ pub fn run(config: SessionConfig) -> Result<()> {
 
         let dc_holder = peer.data_channel();
         let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");
+        let signaling_tx = peer.signaling_tx();
+        let signaling_rx = peer.take_signaling_rx().expect("signaling_rx already taken");
 
         // Spawn the network sender task
-        peer::spawn_sender(dc_holder.clone(), encoded_rx);
+        peer::spawn_sender(dc_holder.clone(), encoded_rx, conn_state.clone());
 
-        anyhow::Ok((dc_holder, incoming_rx))
+        // Spawn the reconnection monitor
+        peer::spawn_reconnect_monitor(
+            peer.rtc_pc(),
+            dc_holder.clone(),
+            peer.disconnect_notify(),
+            signaling_rx,
+            conn_state.clone(),
+            role,
+        );
+
+        anyhow::Ok((dc_holder, incoming_rx, signaling_tx))
     })?;
 
     tracing::info!("Signaling complete, starting capture and viewer");
@@ -143,7 +159,7 @@ pub fn run(config: SessionConfig) -> Result<()> {
 
     // Start the decoder thread (reads incoming H264 from transport, writes to frame buffer)
     let fb = frame_buffer.clone();
-    let conn = connected.clone();
+    let decoder_conn_state = conn_state.clone();
     let _decoder_handle = std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || {
@@ -157,14 +173,24 @@ pub fn run(config: SessionConfig) -> Result<()> {
 
             let mut incoming_rx = incoming_rx;
             let mut reassembler = crate::transport::framing::Reassembler::new();
-            conn.store(true, Ordering::Relaxed);
+            decoder_conn_state.set(ConnState::Connected);
 
             while let Some(raw_msg) = incoming_rx.blocking_recv() {
-                // Reassemble chunked messages
-                let h264_data = match reassembler.feed(&raw_msg) {
-                    Some(complete) => complete,
-                    None => continue, // More chunks needed
+                // Classify the message: video data, signaling, or pending
+                let h264_data = match reassembler.feed_classified(&raw_msg) {
+                    IncomingMessage::VideoData(data) => data,
+                    IncomingMessage::Signaling(json) => {
+                        // Route signaling messages to the reconnect monitor
+                        let _ = signaling_tx.blocking_send(json);
+                        continue;
+                    }
+                    IncomingMessage::Pending => continue,
                 };
+
+                // Reset reassembler if we were reconnecting and are now getting data again
+                if decoder_conn_state.get() == ConnState::Reconnecting {
+                    reassembler.reset();
+                }
 
                 match decoder.decode(&h264_data) {
                     Ok(Some((w, h, rgba))) => {
@@ -185,7 +211,7 @@ pub fn run(config: SessionConfig) -> Result<()> {
         })?;
 
     // Run the egui viewer on the main thread
-    let viewer = ViewerApp::new(frame_buffer, connected);
+    let viewer = ViewerApp::new(frame_buffer, conn_state);
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Screen Share")

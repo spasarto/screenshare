@@ -18,6 +18,21 @@ impl SignalingBlob {
             sdp_type: sdp.sdp_type.to_string(),
         }
     }
+
+    /// Serialize to JSON bytes (for in-band signaling over an already-encrypted data channel).
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).context("Failed to serialize signaling blob")
+    }
+
+    /// Deserialize from JSON bytes.
+    pub fn from_json(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).context("Failed to deserialize signaling blob")
+    }
+
+    /// Convert to an RTCSessionDescription.
+    pub fn into_sdp(self) -> Result<RTCSessionDescription> {
+        blob_to_sdp(self)
+    }
 }
 
 pub fn encode_blob(sdp: &RTCSessionDescription, crypto: &Crypto) -> Result<String> {
@@ -32,9 +47,12 @@ pub fn decode_blob(encoded: &str, crypto: &Crypto) -> Result<RTCSessionDescripti
         .decode(encoded.trim())
         .context("Invalid base64 in signaling blob")?;
     let json = crypto.decrypt(&encrypted)?;
-    let blob: SignalingBlob =
-        serde_json::from_slice(&json).context("Failed to deserialize SDP")?;
+    let blob: SignalingBlob = serde_json::from_slice(&json).context("Failed to deserialize SDP")?;
 
+    blob_to_sdp(blob)
+}
+
+fn blob_to_sdp(blob: SignalingBlob) -> Result<RTCSessionDescription> {
     let sdp_type = match blob.sdp_type.as_str() {
         "offer" => webrtc::peer_connection::sdp::sdp_type::RTCSdpType::Offer,
         "answer" => webrtc::peer_connection::sdp::sdp_type::RTCSdpType::Answer,
