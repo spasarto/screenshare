@@ -1,3 +1,4 @@
+pub mod crypto;
 pub mod framing;
 pub mod peer;
 pub mod signaling;

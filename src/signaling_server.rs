@@ -1,3 +1,4 @@
+use crate::transport::crypto::SessionKey;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -63,7 +64,7 @@ impl SignalingServer {
         }
     }
 
-    /// Create a new session. Optionally pass a custom pin code. Returns (6-digit code, ICE servers).
+    /// Create a new session. Optionally pass a custom pin code. Returns (session code, ICE servers).
     pub async fn create_session(
         &self,
         custom_pin: Option<&str>,
@@ -140,13 +141,14 @@ impl SignalingServer {
         }
     }
 
-    /// Upload the offer SDP to the session.
-    pub async fn upload_offer(&self, code: &str, sdp_json: &str) -> Result<()> {
+    /// Upload the offer SDP to the session, encrypted under `key`.
+    pub async fn upload_offer(&self, code: &str, sdp_json: &str, key: &SessionKey) -> Result<()> {
+        let ciphertext = key.encrypt(sdp_json).context("Failed to encrypt offer")?;
         let url = format!("{}/api/session/{}/offer", self.base_url, code);
         let resp = self
             .client
             .put(&url)
-            .body(sdp_json.to_string())
+            .body(ciphertext)
             .send()
             .await
             .context("Failed to upload offer")?;
@@ -159,13 +161,14 @@ impl SignalingServer {
         Ok(())
     }
 
-    /// Upload the answer SDP to the session.
-    pub async fn upload_answer(&self, code: &str, sdp_json: &str) -> Result<()> {
+    /// Upload the answer SDP to the session, encrypted under `key`.
+    pub async fn upload_answer(&self, code: &str, sdp_json: &str, key: &SessionKey) -> Result<()> {
+        let ciphertext = key.encrypt(sdp_json).context("Failed to encrypt answer")?;
         let url = format!("{}/api/session/{}/answer", self.base_url, code);
         let resp = self
             .client
             .put(&url)
-            .body(sdp_json.to_string())
+            .body(ciphertext)
             .send()
             .await
             .context("Failed to upload answer")?;
@@ -178,8 +181,11 @@ impl SignalingServer {
         Ok(())
     }
 
-    /// Poll for the offer SDP until it's available. Returns the offer JSON string.
-    pub async fn poll_offer(&self, code: &str) -> Result<String> {
+    /// Poll for the offer SDP until it's available and decrypts under `key`.
+    /// Returns the offer JSON string. A blob that fails to decrypt (wrong
+    /// code, or forged by someone who doesn't have it) is treated the same
+    /// as "not ready yet" rather than being handed to the caller.
+    pub async fn poll_offer(&self, code: &str, key: &SessionKey) -> Result<String> {
         let url = format!("{}/api/session/{}/offer", self.base_url, code);
         let start = std::time::Instant::now();
 
@@ -203,17 +209,28 @@ impl SignalingServer {
 
             let parsed: PollOfferResponse = resp.json().await?;
             if parsed.ready {
-                return parsed
+                let ciphertext = parsed
                     .offer
-                    .context("Server said ready but no offer present");
+                    .context("Server said ready but no offer present")?;
+                match key.decrypt(&ciphertext) {
+                    Ok(plaintext) => return Ok(plaintext),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Offer for session {code} failed to decrypt ({e:#}); ignoring"
+                        );
+                    }
+                }
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
-    /// Poll for the answer SDP until it's available. Returns the answer JSON string.
-    pub async fn poll_answer(&self, code: &str) -> Result<String> {
+    /// Poll for the answer SDP until it's available and decrypts under `key`.
+    /// Returns the answer JSON string. A blob that fails to decrypt (wrong
+    /// code, or forged by someone who doesn't have it) is treated the same
+    /// as "not ready yet" rather than being applied.
+    pub async fn poll_answer(&self, code: &str, key: &SessionKey) -> Result<String> {
         let url = format!("{}/api/session/{}/answer", self.base_url, code);
         let start = std::time::Instant::now();
 
@@ -237,9 +254,18 @@ impl SignalingServer {
 
             let parsed: PollAnswerResponse = resp.json().await?;
             if parsed.ready {
-                return parsed
+                let ciphertext = parsed
                     .answer
-                    .context("Server said ready but no answer present");
+                    .context("Server said ready but no answer present")?;
+                match key.decrypt(&ciphertext) {
+                    Ok(plaintext) => return Ok(plaintext),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Answer for session {code} failed to decrypt ({e:#}); ignoring \
+                             (this is expected if someone else is probing this code)"
+                        );
+                    }
+                }
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;

@@ -21,7 +21,7 @@ pub enum Role {
 }
 
 pub enum SessionEvent {
-    /// Offerer: session created, here's the 6-digit code to share.
+    /// Offerer: session created, here's the code to share.
     SessionCode(String),
     SessionReady {
         frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
@@ -84,20 +84,25 @@ fn run_offerer(
 
         // Create session and get ICE servers from the signaling server
         let (code, ice_servers) = server.create_session(custom_pin).await?;
+        // Derived from the code both peers share out of band; never sent to
+        // the signaling server. See transport::crypto for why this matters.
+        let key = crate::transport::crypto::SessionKey::derive(&code);
 
         let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
         let offer_json = peer.create_offer().await?;
 
         // Upload offer SDP to the signaling server
-        server.upload_offer(&code, &offer_json).await?;
+        server.upload_offer(&code, &offer_json, &key).await?;
 
         // Tell the GUI the session code so the user can share it
         event_tx
             .send(SessionEvent::SessionCode(code.clone()))
             .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
 
-        // Poll for the answer from the remote peer
-        let answer_json = server.poll_answer(&code).await?;
+        // Poll for the answer from the remote peer. Answers that don't
+        // decrypt under `key` (i.e. didn't come from someone holding the
+        // real code) are silently skipped inside poll_answer.
+        let answer_json = server.poll_answer(&code, &key).await?;
         peer.set_answer(&answer_json).await?;
 
         let dc_holder = peer.data_channel();
@@ -163,17 +168,22 @@ fn run_answerer(
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
         let server = SignalingServer::new(&server_url);
 
+        // Derived from the code the user was given out of band; never sent
+        // to the signaling server. See transport::crypto for why this matters.
+        let key = crate::transport::crypto::SessionKey::derive(session_code);
+
         // Join the session, polling until it exists (handles client starting before server)
         let ice_servers = server.join_session_polling(session_code).await?;
 
-        // Poll for the offer from the remote peer
-        let offer_json = server.poll_offer(session_code).await?;
+        // Poll for the offer from the remote peer. An offer that doesn't
+        // decrypt under `key` (wrong code) is silently skipped inside poll_offer.
+        let offer_json = server.poll_offer(session_code, &key).await?;
 
         let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
         let answer_json = peer.accept_offer(&offer_json).await?;
 
         // Upload our answer to the signaling server
-        server.upload_answer(session_code, &answer_json).await?;
+        server.upload_answer(session_code, &answer_json, &key).await?;
 
         let dc_holder = peer.data_channel();
         let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");

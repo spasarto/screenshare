@@ -32,7 +32,7 @@ The binary is produced at `target/release/screenshare.exe`.
 screenshare
 ```
 
-Launch the app, choose **Create** or **Join**, select a window to share, and exchange the 6-digit session code with the remote peer.
+Launch the app, choose **Create** or **Join**, select a window to share, and exchange the session code with the remote peer.
 
 ### CLI flags
 
@@ -43,17 +43,17 @@ Options:
       --server              Start in server mode (create session)
       --client              Start in client mode (join session)
       --process <PROCESS>   Process name to wait for and share (substring match, case-insensitive)
-      --pin <PIN>           6-digit session pin
+      --pin <PIN>           Session pin (6 digits + 4 lowercase letters)
 ```
 
 **Examples:**
 
 ```sh
 # Create a session sharing a window from "firefox", with a specific pin
-screenshare --server --process firefox --pin 123456
+screenshare --server --process firefox --pin 123456abcd
 
 # Join an existing session and share a window from "notepad"
-screenshare --client --process notepad --pin 123456
+screenshare --client --process notepad --pin 123456abcd
 ```
 
 When `--process` is specified, the app waits for a matching window to appear and selects it automatically.
@@ -80,7 +80,7 @@ Both peers capture and encode, so each side sees the other's screen.
 
 A Cloudflare Worker (`worker/`) handles initial session setup:
 
-1. **Create session** — generates a 6-digit code, provisions TURN credentials, stores SDP offer/answer in KV.
+1. **Create session** — generates a session code, provisions TURN credentials, and stores the (encrypted) SDP offer/answer in a Durable Object. A per-IP rate limit on the code-gated endpoints makes brute-forcing a code infeasible.
 2. **Join session** — the other peer polls for the offer, uploads its answer.
 3. After the WebRTC connection is established, all further signaling (ICE restarts) happens in-band over the data channel.
 

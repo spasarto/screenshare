@@ -11,6 +11,12 @@
 /// - Signaling message: [0x03][payload]  (JSON-serialized SignalingBlob)
 const MAX_CHUNK_PAYLOAD: usize = 15000; // Well under 16KB SCTP limit
 
+/// Upper bound on a reassembled message's declared length. Guards the
+/// peer-supplied 32-bit length in the chunked-start frame: without this, a
+/// hostile or malformed 5-byte message can claim a length up to 4 GiB and
+/// drive an allocation of that size via `Vec::reserve`.
+const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB, comfortably above any keyframe we produce
+
 pub const MSG_SIGNALING: u8 = 0x03;
 
 /// Encode a signaling payload (JSON bytes) into a framed message.
@@ -111,6 +117,13 @@ impl Reassembler {
                     return None;
                 }
                 let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
+                if len > MAX_MESSAGE_SIZE {
+                    // Refuse to reserve for an implausible length. Leave `active`
+                    // false so any continuation chunks for this bogus start are
+                    // dropped rather than accumulated.
+                    self.active = false;
+                    return None;
+                }
                 self.expected = len;
                 self.buffer.clear();
                 self.buffer.reserve(len);

@@ -215,7 +215,7 @@ impl App {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.session_code)
                                 .desired_width(120.0)
-                                .hint_text("e.g. 482917"),
+                                .hint_text("e.g. 482917bcdq"),
                         );
                     });
                 }
@@ -269,7 +269,7 @@ impl App {
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
-                let code = self.session_code.trim().to_string();
+                let code = self.session_code.trim().to_lowercase();
                 if code.is_empty() {
                     self.setup_error = Some("Enter a session code".into());
                     // Put windows back
@@ -302,7 +302,7 @@ impl App {
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
-                let code = self.session_code.trim().to_string();
+                let code = self.session_code.trim().to_lowercase();
                 crate::app::spawn_answerer(SERVER_URL.to_string(), window, code, event_tx);
                 self.phase = Phase::Joining;
             }

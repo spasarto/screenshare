@@ -8,9 +8,17 @@ compatibility_date = "2024-12-01"
 name = "SESSION_DO"
 class_name = "Session"
 
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
 [[migrations]]
 tag = "v1"
 new_classes = ["Session"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["RateLimiter"]
 
 # Secrets (set via `wrangler secret put`):
 #   TURN_TOKEN_ID

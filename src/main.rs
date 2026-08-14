@@ -26,9 +26,19 @@ pub struct CliArgs {
     #[arg(long)]
     pub process: Option<String>,
 
-    /// 6-digit session pin. Server: use this pin instead of generating one. Client: connect to this pin.
+    /// Session pin (6 digits + 4 lowercase letters). Server: use this pin instead of
+    /// generating one. Client: connect to this pin.
     #[arg(long)]
     pub pin: Option<String>,
+}
+
+/// A valid session pin is 6 ASCII digits followed by 4 lowercase ASCII letters,
+/// matching the format the signaling server generates and accepts.
+fn is_valid_pin(pin: &str) -> bool {
+    let bytes = pin.as_bytes();
+    bytes.len() == 10
+        && bytes[..6].iter().all(|b| b.is_ascii_digit())
+        && bytes[6..].iter().all(|b| b.is_ascii_lowercase())
 }
 
 fn main() -> Result<()> {
@@ -43,8 +53,8 @@ fn main() -> Result<()> {
 
     // Validate pin format if provided
     if let Some(ref pin) = args.pin {
-        if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
-            anyhow::bail!("Pin must be exactly 6 digits (e.g. 123456)");
+        if !is_valid_pin(pin) {
+            anyhow::bail!("Pin must be 6 digits followed by 4 lowercase letters (e.g. 482917bcdq)");
         }
     }
 
