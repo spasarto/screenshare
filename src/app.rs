@@ -353,21 +353,35 @@ fn start_media_threads(
 
             let mut incoming_rx = incoming_rx;
             let mut reassembler = crate::transport::framing::Reassembler::new();
-            decoder_conn_state.set(ConnState::Connected);
+            // `on_peer_connection_state_change` (peer.rs) is the single source
+            // of truth for conn_state; setting Connected here raced it and
+            // could stomp a concurrent transition into Reconnecting.
+            let mut last_conn_state = decoder_conn_state.get();
 
             while let Some(raw_msg) = incoming_rx.blocking_recv() {
+                // Discard any in-flight partial frame as soon as we notice the
+                // connection dropped, rather than only on the next full
+                // reassembly (which may never come for the stale data).
+                let current_conn_state = decoder_conn_state.get();
+                if current_conn_state == ConnState::Reconnecting
+                    && last_conn_state != ConnState::Reconnecting
+                {
+                    reassembler.reset();
+                }
+                last_conn_state = current_conn_state;
+
                 let h264_data = match reassembler.feed_classified(&raw_msg) {
                     IncomingMessage::VideoData(data) => data,
                     IncomingMessage::Signaling(json) => {
-                        let _ = signaling_tx.blocking_send(json);
+                        if signaling_tx.try_send(json).is_err() {
+                            tracing::warn!(
+                                "Signaling channel full or closed, dropping in-band message"
+                            );
+                        }
                         continue;
                     }
                     IncomingMessage::Pending => continue,
                 };
-
-                if decoder_conn_state.get() == ConnState::Reconnecting {
-                    reassembler.reset();
-                }
 
                 match decoder.decode(&h264_data) {
                     Ok(Some((w, h, rgba))) => {

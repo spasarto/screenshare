@@ -6,13 +6,20 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 pub struct SignalingBlob {
     pub sdp: String,
     pub sdp_type: String,
+    /// Reconnect-attempt generation this blob belongs to. Lets a receiver
+    /// tell a fresh ICE-restart offer/answer apart from one left over from
+    /// an earlier, abandoned attempt. Unused (0) for the initial
+    /// server-relayed offer/answer, which has no reconnect attempt yet.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 impl SignalingBlob {
-    pub fn from_sdp(sdp: &RTCSessionDescription) -> Self {
+    pub fn from_sdp(sdp: &RTCSessionDescription, generation: u32) -> Self {
         Self {
             sdp: sdp.sdp.clone(),
             sdp_type: sdp.sdp_type.to_string(),
+            generation,
         }
     }
 
@@ -34,7 +41,7 @@ impl SignalingBlob {
 
 /// Encode an SDP to a JSON string (for server-relayed signaling).
 pub fn encode_sdp_json(sdp: &RTCSessionDescription) -> Result<String> {
-    let blob = SignalingBlob::from_sdp(sdp);
+    let blob = SignalingBlob::from_sdp(sdp, 0);
     serde_json::to_string(&blob).context("Failed to serialize SDP to JSON")
 }
 

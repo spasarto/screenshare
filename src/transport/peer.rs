@@ -22,6 +22,12 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const BACKOFF_BASE_MS: u64 = 1000;
 const BACKOFF_CAP_MS: u64 = 30000;
 
+/// Above this much unsent data queued on the SCTP send buffer, drop the next
+/// frame instead of adding to it. Without a ceiling the queue grows without
+/// bound on a link slower than the encoder's bitrate, and the viewer falls
+/// permanently behind rather than recovering.
+const MAX_BUFFERED_AMOUNT: usize = 262_144; // 256 KiB
+
 pub struct PeerConnection {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
@@ -340,18 +346,76 @@ pub fn spawn_sender(
                 continue;
             }
 
-            let dc_guard = dc_holder.lock().await;
-            if let Some(dc) = dc_guard.as_ref() {
-                let chunks = super::framing::encode_chunked(&data);
-                for chunk in chunks {
-                    if let Err(e) = dc.send(&bytes::Bytes::from(chunk)).await {
-                        tracing::warn!("Failed to send on data channel: {e}");
-                        break;
-                    }
+            // Clone the channel handle and release the holder lock before
+            // sending. Holding it across a whole frame's chunks previously
+            // blocked `send_raw`'s ICE-restart signaling (which needs the
+            // same lock) for as long as this send took.
+            let dc = {
+                let dc_guard = dc_holder.lock().await;
+                dc_guard.clone()
+            };
+            let Some(dc) = dc else { continue };
+
+            // The link can't keep up with the encoder; drop this frame
+            // rather than let the SCTP send queue grow without bound.
+            if dc.buffered_amount().await > MAX_BUFFERED_AMOUNT {
+                continue;
+            }
+
+            let chunks = super::framing::encode_chunked(&data);
+            for chunk in chunks {
+                if let Err(e) = dc.send(&bytes::Bytes::from(chunk)).await {
+                    tracing::warn!("Failed to send on data channel: {e}");
+                    break;
                 }
             }
         }
     })
+}
+
+/// Drop any signaling messages still sitting in the channel from a previous,
+/// abandoned reconnect attempt so the next attempt doesn't consume them.
+fn drain_stale_signaling(signaling_rx: &mut mpsc::Receiver<Vec<u8>>) {
+    let mut dropped = 0u32;
+    while signaling_rx.try_recv().is_ok() {
+        dropped += 1;
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            "Reconnect monitor: dropped {dropped} stale signaling message(s) \
+             left over from a previous attempt"
+        );
+    }
+}
+
+/// Wait for a signaling blob tagged with `generation`, discarding anything
+/// else (a straggler from an earlier attempt) until `timeout` elapses.
+async fn recv_matching_generation(
+    signaling_rx: &mut mpsc::Receiver<Vec<u8>>,
+    generation: u32,
+    timeout: Duration,
+    what: &str,
+) -> Result<SignalingBlob> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow::anyhow!("Timed out waiting for {what}"));
+        }
+        let json = tokio::time::timeout(remaining, signaling_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for {what}"))?
+            .context("Signaling channel closed")?;
+        let blob = SignalingBlob::from_json(&json)?;
+        if blob.generation != generation {
+            tracing::warn!(
+                "Reconnect monitor: discarding stale {what} (generation {} != expected {generation})",
+                blob.generation
+            );
+            continue;
+        }
+        return Ok(blob);
+    }
 }
 
 /// Send a raw framed message over the data channel.
@@ -415,8 +479,14 @@ pub fn spawn_reconnect_monitor(
                 continue;
             }
 
+            // A message left over from a previous, abandoned attempt must
+            // not be mistaken for part of this one.
+            drain_stale_signaling(&mut signaling_rx);
+
             let result = match role {
-                Role::Offerer => ice_restart_offerer(&pc, &dc_holder, &mut signaling_rx).await,
+                Role::Offerer => {
+                    ice_restart_offerer(&pc, &dc_holder, &mut signaling_rx, attempt).await
+                }
                 Role::Answerer => ice_restart_answerer(&pc, &dc_holder, &mut signaling_rx).await,
             };
 
@@ -470,6 +540,7 @@ async fn ice_restart_offerer(
     pc: &Arc<RTCPeerConnection>,
     dc_holder: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     signaling_rx: &mut mpsc::Receiver<Vec<u8>>,
+    generation: u32,
 ) -> Result<()> {
     pc.restart_ice()
         .await
@@ -495,20 +566,22 @@ async fn ice_restart_offerer(
         .context("No local description after ICE restart")?;
 
     // Send the offer over the data channel as a signaling frame
-    let blob = SignalingBlob::from_sdp(&local_desc);
+    let blob = SignalingBlob::from_sdp(&local_desc, generation);
     let json = blob.to_json()?;
     let frame = super::framing::encode_signaling(&json);
     send_raw(dc_holder, frame).await?;
 
     tracing::info!("Reconnect monitor (offerer): sent ICE restart offer, waiting for answer");
 
-    // Wait for the answer (with timeout)
-    let answer_json = tokio::time::timeout(Duration::from_secs(15), signaling_rx.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for ICE restart answer"))?
-        .context("Signaling channel closed")?;
-
-    let answer_blob = SignalingBlob::from_json(&answer_json)?;
+    // Wait for the answer matching this attempt, ignoring anything left over
+    // from an earlier one that slipped in after the drain above.
+    let answer_blob = recv_matching_generation(
+        signaling_rx,
+        generation,
+        Duration::from_secs(15),
+        "ICE restart answer",
+    )
+    .await?;
     let answer_sdp = answer_blob.into_sdp()?;
 
     pc.set_remote_description(answer_sdp)
@@ -526,13 +599,15 @@ async fn ice_restart_answerer(
 ) -> Result<()> {
     tracing::info!("Reconnect monitor (answerer): waiting for ICE restart offer");
 
-    // Wait for the offer (with timeout)
+    // The caller already drained anything left over from a previous
+    // attempt, so the first offer to arrive here belongs to this one.
     let offer_json = tokio::time::timeout(Duration::from_secs(30), signaling_rx.recv())
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for ICE restart offer"))?
         .context("Signaling channel closed")?;
 
     let offer_blob = SignalingBlob::from_json(&offer_json)?;
+    let generation = offer_blob.generation;
     let offer_sdp = offer_blob.into_sdp()?;
 
     pc.set_remote_description(offer_sdp)
@@ -555,8 +630,9 @@ async fn ice_restart_answerer(
         .await
         .context("No local description after creating answer")?;
 
-    // Send the answer back over the data channel
-    let blob = SignalingBlob::from_sdp(&local_desc);
+    // Send the answer back over the data channel, tagged with the same
+    // generation as the offer it responds to.
+    let blob = SignalingBlob::from_sdp(&local_desc, generation);
     let json = blob.to_json()?;
     let frame = super::framing::encode_signaling(&json);
     send_raw(dc_holder, frame).await?;
