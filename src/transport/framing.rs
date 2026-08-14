@@ -162,3 +162,131 @@ impl Reassembler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(size: usize) {
+        let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        let frames = encode_chunked(&data);
+        let mut reassembler = Reassembler::new();
+
+        let mut result = None;
+        let last = frames.len() - 1;
+        for (i, frame) in frames.iter().enumerate() {
+            let out = reassembler.feed(frame);
+            if i == last {
+                result = out;
+            } else {
+                assert!(out.is_none(), "frame {i}/{last} produced output early");
+            }
+        }
+
+        assert_eq!(result, Some(data), "roundtrip failed for size {size}");
+    }
+
+    #[test]
+    fn roundtrip_one_byte() {
+        roundtrip(1);
+    }
+
+    #[test]
+    fn roundtrip_exactly_max_chunk_payload() {
+        roundtrip(MAX_CHUNK_PAYLOAD);
+    }
+
+    #[test]
+    fn roundtrip_one_over_max_chunk_payload() {
+        roundtrip(MAX_CHUNK_PAYLOAD + 1);
+    }
+
+    #[test]
+    fn roundtrip_several_chunks() {
+        roundtrip(MAX_CHUNK_PAYLOAD * 2);
+        roundtrip(MAX_CHUNK_PAYLOAD * 2 + 1);
+        roundtrip(MAX_CHUNK_PAYLOAD * 3 + 123);
+    }
+
+    #[test]
+    fn truncated_single_message_header() {
+        let mut reassembler = Reassembler::new();
+        assert!(reassembler.feed(&[0x00]).is_none());
+    }
+
+    #[test]
+    fn truncated_chunk_start_header() {
+        let mut reassembler = Reassembler::new();
+        assert!(reassembler.feed(&[0x01, 0xFF]).is_none());
+    }
+
+    #[test]
+    fn continuation_chunk_without_start_is_dropped() {
+        let mut reassembler = Reassembler::new();
+        assert!(reassembler.feed(&[0x02, 1, 2, 3]).is_none());
+
+        // A stray 0x02 must not leave the reassembler in a bad state: a
+        // proper start + chunk still reassembles correctly afterwards.
+        let data = vec![9u8; 10];
+        let frames = encode_chunked(&data);
+        let mut result = None;
+        for frame in &frames {
+            result = reassembler.feed(frame);
+        }
+        assert_eq!(result, Some(data));
+    }
+
+    #[test]
+    fn declared_length_far_larger_than_data_stays_pending() {
+        let mut reassembler = Reassembler::new();
+        let mut start = vec![0x01];
+        start.extend_from_slice(&(1_000_000u32).to_be_bytes());
+        assert!(reassembler.feed(&start).is_none());
+
+        // Only a handful of bytes actually show up; must not complete or panic.
+        let mut chunk = vec![0x02];
+        chunk.extend_from_slice(&[1, 2, 3, 4, 5]);
+        assert!(reassembler.feed(&chunk).is_none());
+    }
+
+    #[test]
+    fn declared_length_above_max_message_size_is_rejected() {
+        let mut reassembler = Reassembler::new();
+        let mut start = vec![0x01];
+        start.extend_from_slice(&(0xFFFFFFFFu32).to_be_bytes());
+        assert!(reassembler.feed(&start).is_none());
+
+        // The bogus start must not have armed reassembly: a follow-up chunk
+        // is dropped rather than accumulated toward a 4 GiB buffer.
+        assert!(reassembler.feed(&[0x02, 1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn signaling_frames_interleaved_with_video_chunks() {
+        let data = vec![7u8; MAX_CHUNK_PAYLOAD * 2 + 50];
+        let frames = encode_chunked(&data);
+        assert!(frames.len() >= 3, "test needs a multi-chunk message");
+
+        let mut reassembler = Reassembler::new();
+        let signaling_payload = br#"{"type":"ice-restart"}"#;
+        let signaling_frame = encode_signaling(signaling_payload);
+
+        let mut video_result = None;
+        for (i, frame) in frames.iter().enumerate() {
+            match reassembler.feed_classified(&signaling_frame) {
+                IncomingMessage::Signaling(payload) => {
+                    assert_eq!(payload, signaling_payload);
+                }
+                _ => panic!("signaling frame misclassified"),
+            }
+
+            match reassembler.feed_classified(frame) {
+                IncomingMessage::VideoData(d) => video_result = Some(d),
+                IncomingMessage::Pending => {}
+                IncomingMessage::Signaling(_) => panic!("video frame {i} misclassified as signaling"),
+            }
+        }
+
+        assert_eq!(video_result, Some(data));
+    }
+}
