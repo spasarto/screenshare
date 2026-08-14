@@ -4,9 +4,13 @@ compatibility_date = "2024-12-01"
 
 # Custom domain: screenshare.aghj.dev (set in Cloudflare dashboard)
 
-[[kv_namespaces]]
-binding = "SESSIONS"
-id = "59469371c4d945cead2dac1c27488185"
+[[durable_objects.bindings]]
+name = "SESSION_DO"
+class_name = "Session"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["Session"]
 
 # Secrets (set via `wrangler secret put`):
 #   TURN_TOKEN_ID

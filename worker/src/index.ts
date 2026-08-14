@@ -1,12 +1,12 @@
 interface Env {
-  SESSIONS: KVNamespace;
+  SESSION_DO: DurableObjectNamespace;
   TURN_TOKEN_ID: string;
   TURN_API_TOKEN: string;
 }
 
-interface Session {
-  offer?: string;
-  answer?: string;
+interface SessionData {
+  offer: string | null;
+  answer: string | null;
 }
 
 const SESSION_TTL = 300; // 5 minutes
@@ -51,6 +51,77 @@ async function fetchIceServers(env: Env): Promise<unknown> {
   return data.iceServers;
 }
 
+/**
+ * One Durable Object instance per session code. All reads/writes for a
+ * given code are serialized through this single object, so an offer and
+ * an answer landing at the same time can no longer clobber each other,
+ * and there's no edge cache to serve a stale "no answer yet" response.
+ */
+export class Session implements DurableObject {
+  private session: SessionData | null | undefined;
+
+  constructor(private state: DurableObjectState) {}
+
+  private async load(): Promise<void> {
+    if (this.session === undefined) {
+      this.session = (await this.state.storage.get<SessionData>("session")) ?? null;
+    }
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    await this.load();
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (path === "/" && request.method === "POST") {
+      if (this.session) return err("Pin already in use", 409);
+      this.session = { offer: null, answer: null };
+      await this.state.storage.put("session", this.session);
+      await this.state.storage.setAlarm(Date.now() + SESSION_TTL * 1000);
+      return json({ ok: true });
+    }
+
+    if (!this.session) return err("Session not found or expired", 404);
+
+    if (path === "/" && request.method === "GET") {
+      return json({ ok: true });
+    }
+
+    if (path === "/offer" && request.method === "PUT") {
+      this.session.offer = await request.text();
+      await this.state.storage.put("session", this.session);
+      return json({ ok: true });
+    }
+
+    if (path === "/offer" && request.method === "GET") {
+      return json(this.session.offer ? { ready: true, offer: this.session.offer } : { ready: false });
+    }
+
+    if (path === "/answer" && request.method === "PUT") {
+      this.session.answer = await request.text();
+      await this.state.storage.put("session", this.session);
+      return json({ ok: true });
+    }
+
+    if (path === "/answer" && request.method === "GET") {
+      return json(this.session.answer ? { ready: true, answer: this.session.answer } : { ready: false });
+    }
+
+    if (path === "/" && request.method === "DELETE") {
+      this.session = null;
+      await this.state.storage.deleteAll();
+      return json({ ok: true });
+    }
+
+    return err("Not found", 404);
+  }
+
+  async alarm(): Promise<void> {
+    this.session = null;
+    await this.state.storage.deleteAll();
+  }
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -81,25 +152,27 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
     let code: string;
     if (requestedCode) {
-      // Use the requested code, but check for collision
-      const existing = await env.SESSIONS.get(requestedCode);
-      if (existing) {
+      const stub = env.SESSION_DO.get(env.SESSION_DO.idFromName(requestedCode));
+      const created = await stub.fetch("https://session/", { method: "POST" });
+      if (created.status === 409) {
         return err("Pin already in use", 409);
       }
       code = requestedCode;
     } else {
-      // Generate a unique 6-digit code (retry on collision)
+      // Generate a unique 6-digit code (retry on collision). The Durable
+      // Object's create is atomic, so this can't race with another
+      // request creating the same code between a check and a write.
       code = generateCode();
       let attempts = 0;
-      do {
-        const existing = await env.SESSIONS.get(code);
-        if (!existing) break;
-        code = generateCode();
+      for (;;) {
+        const stub = env.SESSION_DO.get(env.SESSION_DO.idFromName(code));
+        const created = await stub.fetch("https://session/", { method: "POST" });
+        if (created.status !== 409) break;
         attempts++;
-      } while (attempts < 10);
-
-      if (attempts >= 10) {
-        return err("Too many active sessions, try again later", 503);
+        if (attempts >= 10) {
+          return err("Too many active sessions, try again later", 503);
+        }
+        code = generateCode();
       }
     }
 
@@ -109,11 +182,6 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     } catch (e) {
       return err(`Failed to fetch ICE servers: ${e}`, 502);
     }
-
-    const session: Session = {};
-    await env.SESSIONS.put(code, JSON.stringify(session), {
-      expirationTtl: SESSION_TTL,
-    });
 
     return json({ code, iceServers });
   }
@@ -126,11 +194,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   const code = match[1];
   const sub = match[2] || "";
+  const stub = env.SESSION_DO.get(env.SESSION_DO.idFromName(code));
 
   // GET /api/session/:code — get session info + ICE servers
   if (sub === "" && request.method === "GET") {
-    const raw = await env.SESSIONS.get(code);
-    if (!raw) return err("Session not found or expired", 404);
+    const resp = await stub.fetch("https://session/", { method: "GET" });
+    if (resp.status === 404) return err("Session not found or expired", 404);
 
     let iceServers: unknown;
     try {
@@ -144,63 +213,41 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   // PUT /api/session/:code/offer — store offer SDP
   if (sub === "/offer" && request.method === "PUT") {
-    const raw = await env.SESSIONS.get(code);
-    if (!raw) return err("Session not found or expired", 404);
-
-    const session: Session = JSON.parse(raw);
     const body = await request.text();
     if (!body) return err("Empty body", 400);
 
-    session.offer = body;
-    await env.SESSIONS.put(code, JSON.stringify(session), {
-      expirationTtl: SESSION_TTL,
-    });
+    const resp = await stub.fetch("https://session/offer", { method: "PUT", body });
+    if (resp.status === 404) return err("Session not found or expired", 404);
     return json({ ok: true });
   }
 
   // GET /api/session/:code/offer — get offer SDP
   if (sub === "/offer" && request.method === "GET") {
-    const raw = await env.SESSIONS.get(code);
-    if (!raw) return err("Session not found or expired", 404);
-
-    const session: Session = JSON.parse(raw);
-    if (!session.offer) {
-      return json({ ready: false }, 200);
-    }
-    return json({ ready: true, offer: session.offer });
+    const resp = await stub.fetch("https://session/offer", { method: "GET" });
+    if (resp.status === 404) return err("Session not found or expired", 404);
+    return json(await resp.json());
   }
 
   // PUT /api/session/:code/answer — store answer SDP
   if (sub === "/answer" && request.method === "PUT") {
-    const raw = await env.SESSIONS.get(code);
-    if (!raw) return err("Session not found or expired", 404);
-
-    const session: Session = JSON.parse(raw);
     const body = await request.text();
     if (!body) return err("Empty body", 400);
 
-    session.answer = body;
-    await env.SESSIONS.put(code, JSON.stringify(session), {
-      expirationTtl: SESSION_TTL,
-    });
+    const resp = await stub.fetch("https://session/answer", { method: "PUT", body });
+    if (resp.status === 404) return err("Session not found or expired", 404);
     return json({ ok: true });
   }
 
   // GET /api/session/:code/answer — get answer SDP
   if (sub === "/answer" && request.method === "GET") {
-    const raw = await env.SESSIONS.get(code);
-    if (!raw) return err("Session not found or expired", 404);
-
-    const session: Session = JSON.parse(raw);
-    if (!session.answer) {
-      return json({ ready: false }, 200);
-    }
-    return json({ ready: true, answer: session.answer });
+    const resp = await stub.fetch("https://session/answer", { method: "GET" });
+    if (resp.status === 404) return err("Session not found or expired", 404);
+    return json(await resp.json());
   }
 
   // DELETE /api/session/:code — remove a session (called by the host on exit)
   if (sub === "" && request.method === "DELETE") {
-    await env.SESSIONS.delete(code);
+    await stub.fetch("https://session/", { method: "DELETE" });
     return json({ ok: true });
   }
 
