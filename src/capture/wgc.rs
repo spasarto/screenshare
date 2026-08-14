@@ -15,20 +15,14 @@ use windows_capture::{
 
 struct CaptureHandler {
     tx: SyncSender<Frame>,
-    _target_width: u32,
-    _target_height: u32,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
-    type Flags = (SyncSender<Frame>, u32, u32);
+    type Flags = SyncSender<Frame>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self {
-            tx: ctx.flags.0,
-            _target_width: ctx.flags.1,
-            _target_height: ctx.flags.2,
-        })
+        Ok(Self { tx: ctx.flags })
     }
 
     fn on_frame_arrived(
@@ -63,8 +57,6 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
 pub fn start_capture(
     window: Window,
     frame_tx: SyncSender<Frame>,
-    target_width: u32,
-    target_height: u32,
 ) -> Result<std::thread::JoinHandle<()>> {
     let handle = std::thread::Builder::new()
         .name("capture".into())
@@ -77,7 +69,7 @@ pub fn start_capture(
                 MinimumUpdateIntervalSettings::Default,
                 DirtyRegionSettings::Default,
                 ColorFormat::Bgra8,
-                (frame_tx, target_width, target_height),
+                frame_tx,
             );
 
             if let Err(e) = CaptureHandler::start(settings) {

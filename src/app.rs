@@ -230,7 +230,7 @@ fn start_media_threads(
     frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
     conn_state: SharedConnState,
 ) -> Result<()> {
-    capture::wgc::start_capture(window, capture_tx, TARGET_WIDTH, TARGET_HEIGHT)?;
+    capture::wgc::start_capture(window, capture_tx)?;
 
     std::thread::Builder::new()
         .name("encoder".into())
@@ -238,8 +238,13 @@ fn start_media_threads(
             let mut encoder: Option<H264Encoder> = None;
 
             while let Ok(frame) = capture_rx.recv() {
-                let w = frame.width & !1;
-                let h = frame.height & !1;
+                let (w, h, scaled) = capture::scale_bgra(
+                    &frame.data,
+                    frame.width,
+                    frame.height,
+                    TARGET_WIDTH,
+                    TARGET_HEIGHT,
+                );
 
                 if encoder.is_none()
                     || encoder
@@ -257,20 +262,8 @@ fn start_media_threads(
                 }
 
                 let enc = encoder.as_mut().unwrap();
-                let expected_size = (w * h * 4) as usize;
 
-                if frame.data.len() < expected_size {
-                    tracing::warn!(
-                        "Frame size mismatch: got {} expected {} ({}x{})",
-                        frame.data.len(),
-                        expected_size,
-                        w,
-                        h
-                    );
-                    continue;
-                }
-
-                match enc.encode(&frame.data[..expected_size]) {
+                match enc.encode(&scaled) {
                     Ok(h264_data) => {
                         if !h264_data.is_empty() {
                             let _ = encoded_tx.blocking_send(h264_data);
