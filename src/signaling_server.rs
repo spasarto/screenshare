@@ -1,6 +1,7 @@
 use crate::transport::crypto::SessionKey;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tokio::sync::watch;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -43,6 +44,29 @@ struct PollOfferResponse {
 struct PollAnswerResponse {
     ready: bool,
     answer: Option<String>,
+}
+
+/// Marks a poll loop bailing out because the caller cancelled it, as opposed
+/// to a real failure. Callers can tell the two apart with `downcast_ref`
+/// instead of matching on an error message.
+#[derive(Debug)]
+pub(crate) struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Sleep for `POLL_INTERVAL`, waking early if `cancel` is flipped to `true`.
+/// Returns an error in that case so callers can bail out of their poll loop.
+async fn sleep_or_cancelled(cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    tokio::select! {
+        _ = tokio::time::sleep(POLL_INTERVAL) => Ok(()),
+        _ = cancel.wait_for(|&c| c) => Err(Cancelled.into()),
+    }
 }
 
 fn to_rtc_servers(entries: Vec<IceServerEntry>) -> Vec<RTCIceServer> {
@@ -104,11 +128,19 @@ impl SignalingServer {
     /// Join a session, polling until it appears on the signaling server.
     /// This handles the case where the client launches before the server has created
     /// the session — retries on 404 until the session exists or the timeout elapses.
-    pub async fn join_session_polling(&self, code: &str) -> Result<Vec<RTCIceServer>> {
+    pub async fn join_session_polling(
+        &self,
+        code: &str,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<Vec<RTCIceServer>> {
         let url = format!("{}/api/session/{}", self.base_url, code);
         let start = std::time::Instant::now();
 
         loop {
+            if *cancel.borrow() {
+                return Err(Cancelled.into());
+            }
+
             if start.elapsed() > POLL_TIMEOUT {
                 anyhow::bail!("Timed out waiting for session to be created");
             }
@@ -122,7 +154,7 @@ impl SignalingServer {
 
             if resp.status().as_u16() == 404 {
                 tracing::info!("Session {code} not found yet, retrying...");
-                tokio::time::sleep(POLL_INTERVAL).await;
+                sleep_or_cancelled(&mut cancel).await?;
                 continue;
             }
 
@@ -185,11 +217,20 @@ impl SignalingServer {
     /// Returns the offer JSON string. A blob that fails to decrypt (wrong
     /// code, or forged by someone who doesn't have it) is treated the same
     /// as "not ready yet" rather than being handed to the caller.
-    pub async fn poll_offer(&self, code: &str, key: &SessionKey) -> Result<String> {
+    pub async fn poll_offer(
+        &self,
+        code: &str,
+        key: &SessionKey,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<String> {
         let url = format!("{}/api/session/{}/offer", self.base_url, code);
         let start = std::time::Instant::now();
 
         loop {
+            if *cancel.borrow() {
+                return Err(Cancelled.into());
+            }
+
             if start.elapsed() > POLL_TIMEOUT {
                 anyhow::bail!("Timed out waiting for offer");
             }
@@ -222,7 +263,7 @@ impl SignalingServer {
                 }
             }
 
-            tokio::time::sleep(POLL_INTERVAL).await;
+            sleep_or_cancelled(&mut cancel).await?;
         }
     }
 
@@ -230,11 +271,20 @@ impl SignalingServer {
     /// Returns the answer JSON string. A blob that fails to decrypt (wrong
     /// code, or forged by someone who doesn't have it) is treated the same
     /// as "not ready yet" rather than being applied.
-    pub async fn poll_answer(&self, code: &str, key: &SessionKey) -> Result<String> {
+    pub async fn poll_answer(
+        &self,
+        code: &str,
+        key: &SessionKey,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<String> {
         let url = format!("{}/api/session/{}/answer", self.base_url, code);
         let start = std::time::Instant::now();
 
         loop {
+            if *cancel.borrow() {
+                return Err(Cancelled.into());
+            }
+
             if start.elapsed() > POLL_TIMEOUT {
                 anyhow::bail!("Timed out waiting for answer");
             }
@@ -268,7 +318,7 @@ impl SignalingServer {
                 }
             }
 
-            tokio::time::sleep(POLL_INTERVAL).await;
+            sleep_or_cancelled(&mut cancel).await?;
         }
     }
 

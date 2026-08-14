@@ -7,7 +7,7 @@ use crate::transport::{ConnState, SharedConnState};
 use crate::viewer::DecodedFrame;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use windows_capture::window::Window;
 
 const TARGET_WIDTH: u32 = 1280;
@@ -30,38 +30,73 @@ pub enum SessionEvent {
     Error(String),
 }
 
-/// Spawn the offerer session in a background thread.
+/// Spawn the offerer session in a background thread. `cancel_rx` lets the GUI
+/// abandon the session (e.g. the user hits Cancel) without waiting out the
+/// signaling server's poll timeouts.
 pub fn spawn_offerer(
     server_url: String,
     window: Window,
     custom_pin: Option<String>,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
+    cancel_rx: watch::Receiver<bool>,
 ) {
     std::thread::Builder::new()
         .name("session-offerer".into())
         .spawn(move || {
-            if let Err(e) = run_offerer(server_url, window, custom_pin.as_deref(), &event_tx) {
-                let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
+            match run_offerer(
+                server_url,
+                window,
+                custom_pin.as_deref(),
+                &event_tx,
+                cancel_rx,
+            ) {
+                Ok(()) | Err(SessionError::Cancelled) => {}
+                Err(SessionError::Other(e)) => {
+                    let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
+                }
             }
         })
         .expect("Failed to spawn offerer thread");
 }
 
-/// Spawn the answerer session in a background thread.
+/// Spawn the answerer session in a background thread. See `spawn_offerer` for `cancel_rx`.
 pub fn spawn_answerer(
     server_url: String,
     window: Window,
     session_code: String,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
+    cancel_rx: watch::Receiver<bool>,
 ) {
     std::thread::Builder::new()
         .name("session-answerer".into())
         .spawn(move || {
-            if let Err(e) = run_answerer(server_url, window, &session_code, &event_tx) {
-                let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
+            match run_answerer(server_url, window, &session_code, &event_tx, cancel_rx) {
+                Ok(()) | Err(SessionError::Cancelled) => {}
+                Err(SessionError::Other(e)) => {
+                    let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
+                }
             }
         })
         .expect("Failed to spawn answerer thread");
+}
+
+/// Distinguishes a user-initiated cancel from a real failure, so a cancelled
+/// session doesn't flash an error message on its way back to the setup screen.
+enum SessionError {
+    Cancelled,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SessionError {
+    fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::signaling_server::Cancelled>()
+            .is_some()
+        {
+            SessionError::Cancelled
+        } else {
+            SessionError::Other(e)
+        }
+    }
 }
 
 fn run_offerer(
@@ -69,7 +104,8 @@ fn run_offerer(
     window: Window,
     custom_pin: Option<&str>,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
-) -> Result<()> {
+    cancel_rx: watch::Receiver<bool>,
+) -> Result<(), SessionError> {
     let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
     let conn_state = SharedConnState::new();
 
@@ -77,7 +113,11 @@ fn run_offerer(
         std::sync::mpsc::sync_channel::<capture::Frame>(FRAME_CHANNEL_SIZE);
     let (encoded_tx, encoded_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_SIZE);
 
-    let _rt = tokio::runtime::Runtime::new()?;
+    let _rt = tokio::runtime::Runtime::new().map_err(anyhow::Error::from)?;
+
+    if *cancel_rx.borrow() {
+        return Err(SessionError::Cancelled);
+    }
 
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
         let server = SignalingServer::new(&server_url);
@@ -101,8 +141,10 @@ fn run_offerer(
 
         // Poll for the answer from the remote peer. Answers that don't
         // decrypt under `key` (i.e. didn't come from someone holding the
-        // real code) are silently skipped inside poll_answer.
-        let answer_json = server.poll_answer(&code, &key).await?;
+        // real code) are silently skipped inside poll_answer. Cancelling
+        // here (the "waiting for peer" screen) is the common case this
+        // whole plumbing exists for.
+        let answer_json = server.poll_answer(&code, &key, cancel_rx).await?;
         peer.set_answer(&answer_json).await?;
 
         let dc_holder = peer.data_channel();
@@ -155,7 +197,8 @@ fn run_answerer(
     window: Window,
     session_code: &str,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
-) -> Result<()> {
+    cancel_rx: watch::Receiver<bool>,
+) -> Result<(), SessionError> {
     let frame_buffer: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
     let conn_state = SharedConnState::new();
 
@@ -163,7 +206,11 @@ fn run_answerer(
         std::sync::mpsc::sync_channel::<capture::Frame>(FRAME_CHANNEL_SIZE);
     let (encoded_tx, encoded_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_SIZE);
 
-    let _rt = tokio::runtime::Runtime::new()?;
+    let _rt = tokio::runtime::Runtime::new().map_err(anyhow::Error::from)?;
+
+    if *cancel_rx.borrow() {
+        return Err(SessionError::Cancelled);
+    }
 
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
         let server = SignalingServer::new(&server_url);
@@ -173,17 +220,21 @@ fn run_answerer(
         let key = crate::transport::crypto::SessionKey::derive(session_code);
 
         // Join the session, polling until it exists (handles client starting before server)
-        let ice_servers = server.join_session_polling(session_code).await?;
+        let ice_servers = server
+            .join_session_polling(session_code, cancel_rx.clone())
+            .await?;
 
         // Poll for the offer from the remote peer. An offer that doesn't
         // decrypt under `key` (wrong code) is silently skipped inside poll_offer.
-        let offer_json = server.poll_offer(session_code, &key).await?;
+        let offer_json = server.poll_offer(session_code, &key, cancel_rx).await?;
 
         let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
         let answer_json = peer.accept_offer(&offer_json).await?;
 
         // Upload our answer to the signaling server
-        server.upload_answer(session_code, &answer_json, &key).await?;
+        server
+            .upload_answer(session_code, &answer_json, &key)
+            .await?;
 
         let dc_holder = peer.data_channel();
         let incoming_rx = peer.take_incoming_rx().expect("incoming_rx already taken");

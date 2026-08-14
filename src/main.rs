@@ -58,6 +58,13 @@ fn main() -> Result<()> {
         }
     }
 
+    // --client --process auto-starts the join as soon as the target window
+    // appears, with no setup screen in between to type a code into — so
+    // without --pin there's no way the session code ever reaches the app.
+    if args.client && args.process.is_some() && args.pin.is_none() {
+        anyhow::bail!("--client --process requires --pin (there's no setup screen to enter it once auto-start begins)");
+    }
+
     let icon = {
         let bytes = include_bytes!("logo.png");
         let img = image::load_from_memory(bytes)

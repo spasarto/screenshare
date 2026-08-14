@@ -4,6 +4,7 @@ use crate::transport::{ConnState, SharedConnState};
 use crate::CliArgs;
 use egui::TextureHandle;
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 const SERVER_URL: &str = "https://screenshare.aghj.dev";
 
@@ -58,6 +59,10 @@ pub struct App {
 
     // Cleanup: set when we are the offerer and have a session code
     hosted_session_code: Option<String>,
+
+    // Set while a background session thread is signaling (CreatingSession,
+    // WaitingForPeer, Joining). Sending `true` tells it to give up.
+    session_cancel: Option<watch::Sender<bool>>,
 
     // Error
     error_message: String,
@@ -120,8 +125,35 @@ impl App {
             conn_state: None,
             logo_texture,
             hosted_session_code: None,
+            session_cancel: None,
             error_message: String::new(),
         }
+    }
+
+    /// Abandon whatever session is in flight (if any) and return to the
+    /// setup screen. Safe to call from any phase.
+    fn cancel_session(&mut self) {
+        if let Some(tx) = self.session_cancel.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(code) = self.hosted_session_code.take() {
+            let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
+            std::thread::spawn(move || server.delete_session_blocking(&code));
+        }
+        self.event_rx = None;
+        self.frame_buffer = None;
+        self.texture = None;
+        self.conn_state = None;
+        self.setup_error = None;
+        if self.windows.is_empty() {
+            self.windows = picker::enumerate_windows().unwrap_or_default();
+            self.selected_window = if self.windows.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        }
+        self.phase = Phase::Setup;
     }
 
     fn process_events(&mut self) {
@@ -227,10 +259,14 @@ impl App {
 
                 ui.add_space(12.0);
 
+                let can_start = self.selected_window.is_some()
+                    && (self.role == Role::Create
+                        || crate::is_valid_pin(&self.session_code.trim().to_lowercase()));
+
                 if ui
                     .scope(|ui| {
                         ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
-                        ui.button("Start")
+                        ui.add_enabled(can_start, egui::Button::new("Start"))
                     })
                     .inner
                     .clicked()
@@ -247,40 +283,47 @@ impl App {
             return;
         };
 
-        if idx >= self.windows.len() {
+        let Some(window) = self.windows.get(idx).map(|w| w.window) else {
             self.setup_error = Some("Invalid window selection".into());
             return;
-        }
-
-        let windows = std::mem::take(&mut self.windows);
-        let window = windows.into_iter().nth(idx).unwrap().window;
+        };
 
         match self.role {
             Role::Create => {
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 self.event_rx = Some(event_rx);
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                self.session_cancel = Some(cancel_tx);
 
                 crate::app::spawn_offerer(
                     SERVER_URL.to_string(),
                     window,
                     self.cli_pin.clone(),
                     event_tx,
+                    cancel_rx,
                 );
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
                 let code = self.session_code.trim().to_lowercase();
-                if code.is_empty() {
-                    self.setup_error = Some("Enter a session code".into());
-                    // Put windows back
-                    self.windows = picker::enumerate_windows().unwrap_or_default();
+                if !crate::is_valid_pin(&code) {
+                    self.setup_error =
+                        Some("Enter a valid session code (6 digits + 4 letters)".into());
                     return;
                 }
 
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 self.event_rx = Some(event_rx);
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                self.session_cancel = Some(cancel_tx);
 
-                crate::app::spawn_answerer(SERVER_URL.to_string(), window, code, event_tx);
+                crate::app::spawn_answerer(
+                    SERVER_URL.to_string(),
+                    window,
+                    code,
+                    event_tx,
+                    cancel_rx,
+                );
                 self.phase = Phase::Joining;
             }
         }
@@ -290,6 +333,8 @@ impl App {
     fn start_with_window(&mut self, window: windows_capture::window::Window) {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         self.event_rx = Some(event_rx);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.session_cancel = Some(cancel_tx);
 
         match self.role {
             Role::Create => {
@@ -298,18 +343,25 @@ impl App {
                     window,
                     self.cli_pin.clone(),
                     event_tx,
+                    cancel_rx,
                 );
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
                 let code = self.session_code.trim().to_lowercase();
-                crate::app::spawn_answerer(SERVER_URL.to_string(), window, code, event_tx);
+                crate::app::spawn_answerer(
+                    SERVER_URL.to_string(),
+                    window,
+                    code,
+                    event_tx,
+                    cancel_rx,
+                );
                 self.phase = Phase::Joining;
             }
         }
     }
 
-    fn show_creating_session(&self, ctx: &egui::Context) {
+    fn show_creating_session(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
@@ -318,6 +370,10 @@ impl App {
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label("Creating session...");
+                ui.add_space(20.0);
+                if ui.button("Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
         });
     }
@@ -348,6 +404,10 @@ impl App {
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label(format!("Waiting for '{}' to start...", process_name));
+                ui.add_space(20.0);
+                if ui.button("Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
         });
     }
@@ -375,11 +435,15 @@ impl App {
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label("Waiting for peer to join...");
+                ui.add_space(20.0);
+                if ui.button("Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
         });
     }
 
-    fn show_joining(&self, ctx: &egui::Context) {
+    fn show_joining(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
@@ -388,6 +452,10 @@ impl App {
                 ui.spinner();
                 ui.add_space(10.0);
                 ui.label("Joining session...");
+                ui.add_space(20.0);
+                if ui.button("Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
         });
     }
@@ -470,7 +538,7 @@ impl App {
         });
     }
 
-    fn show_error(&self, ctx: &egui::Context) {
+    fn show_error(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
@@ -479,6 +547,10 @@ impl App {
                 ui.colored_label(egui::Color32::RED, "Error");
                 ui.add_space(10.0);
                 ui.label(&self.error_message);
+                ui.add_space(20.0);
+                if ui.button("Try again").clicked() {
+                    self.cancel_session();
+                }
             });
         });
     }
