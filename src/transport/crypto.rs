@@ -18,7 +18,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 const NONCE_LEN: usize = 12;
@@ -33,18 +33,18 @@ impl SessionKey {
     /// what passes through it.
     pub fn derive(session_code: &str) -> Self {
         let digest = Sha256::digest(session_code.as_bytes());
-        Self(*Key::<Aes256Gcm>::from_slice(&digest))
+        Self(Key::<Aes256Gcm>::try_from(digest.as_slice()).expect("SHA-256 digest is 32 bytes"))
     }
 
     /// Encrypt `plaintext`, returning a base64 blob safe to send as an HTTP body.
     pub fn encrypt(&self, plaintext: &str) -> Result<String> {
         let cipher = Aes256Gcm::new(&self.0);
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes.as_slice()).expect("nonce is NONCE_LEN bytes");
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_bytes())
+            .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
 
         let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -64,9 +64,9 @@ impl SessionKey {
         let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
 
         let cipher = Aes256Gcm::new(&self.0);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).context("Invalid nonce length")?;
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| anyhow::anyhow!("Decryption failed (wrong code or tampered data)"))?;
 
         String::from_utf8(plaintext).context("Decrypted payload was not valid UTF-8")

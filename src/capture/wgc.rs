@@ -15,6 +15,7 @@ use windows_capture::{
 
 struct CaptureHandler {
     tx: SyncSender<Frame>,
+    scratch: Vec<u8>,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -22,7 +23,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self { tx: ctx.flags })
+        Ok(Self {
+            tx: ctx.flags,
+            scratch: Vec::new(),
+        })
     }
 
     fn on_frame_arrived(
@@ -33,8 +37,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let width = frame.width();
         let height = frame.height();
 
-        let mut buffer = frame.buffer()?;
-        let data = buffer.as_nopadding_buffer()?.to_vec();
+        let buffer = frame.buffer()?;
+        let data = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
 
         let frame = Frame {
             width,

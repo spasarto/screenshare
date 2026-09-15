@@ -189,8 +189,8 @@ impl App {
         }
     }
 
-    fn show_setup(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn show_setup(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
                 self.show_logo(ui);
@@ -361,8 +361,8 @@ impl App {
         }
     }
 
-    fn show_creating_session(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn show_creating_session(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
                 self.show_logo(ui);
@@ -378,7 +378,7 @@ impl App {
         });
     }
 
-    fn show_waiting_for_process(&mut self, ctx: &egui::Context) {
+    fn show_waiting_for_process(&mut self, ui: &mut egui::Ui) {
         let process_name = self.cli_process.clone().unwrap_or_default();
 
         // Poll for the process every ~1 second
@@ -396,7 +396,7 @@ impl App {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
                 self.show_logo(ui);
@@ -412,8 +412,8 @@ impl App {
         });
     }
 
-    fn show_waiting_for_peer(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn show_waiting_for_peer(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
                 self.show_logo(ui);
@@ -443,8 +443,8 @@ impl App {
         });
     }
 
-    fn show_joining(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn show_joining(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
                 self.show_logo(ui);
@@ -460,7 +460,9 @@ impl App {
         });
     }
 
-    fn show_viewing(&mut self, ctx: &egui::Context) {
+    fn show_viewing(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
         // Check for new frame
         if let Some(fb) = &self.frame_buffer {
             let new_frame = {
@@ -493,7 +495,7 @@ impl App {
             .map(|cs| cs.get())
             .unwrap_or(ConnState::Connecting);
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (color, text) = match state {
                     ConnState::Connected => (egui::Color32::GREEN, "Connected"),
@@ -519,7 +521,7 @@ impl App {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tex) = &self.texture {
                 let available = ui.available_size();
                 let tex_size = tex.size_vec2();
@@ -538,8 +540,8 @@ impl App {
         });
     }
 
-    fn show_error(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn show_error(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
                 self.show_logo(ui);
@@ -557,21 +559,23 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_events();
+
+        let ctx = ui.ctx().clone();
 
         if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
             crate::console::toggle();
         }
 
         match self.phase {
-            Phase::Setup => self.show_setup(ctx),
-            Phase::WaitingForProcess => self.show_waiting_for_process(ctx),
-            Phase::CreatingSession => self.show_creating_session(ctx),
-            Phase::WaitingForPeer => self.show_waiting_for_peer(ctx),
-            Phase::Joining => self.show_joining(ctx),
-            Phase::Viewing => self.show_viewing(ctx),
-            Phase::Error => self.show_error(ctx),
+            Phase::Setup => self.show_setup(ui),
+            Phase::WaitingForProcess => self.show_waiting_for_process(ui),
+            Phase::CreatingSession => self.show_creating_session(ui),
+            Phase::WaitingForPeer => self.show_waiting_for_peer(ui),
+            Phase::Joining => self.show_joining(ui),
+            Phase::Viewing => self.show_viewing(ui),
+            Phase::Error => self.show_error(ui),
         }
 
         match self.phase {
@@ -585,7 +589,7 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         if let Some(code) = &self.hosted_session_code {
             let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
             server.delete_session_blocking(code);
