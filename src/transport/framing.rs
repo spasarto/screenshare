@@ -283,7 +283,9 @@ mod tests {
             match reassembler.feed_classified(frame) {
                 IncomingMessage::VideoData(d) => video_result = Some(d),
                 IncomingMessage::Pending => {}
-                IncomingMessage::Signaling(_) => panic!("video frame {i} misclassified as signaling"),
+                IncomingMessage::Signaling(_) => {
+                    panic!("video frame {i} misclassified as signaling")
+                }
             }
         }
 

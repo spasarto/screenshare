@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
+use openh264::OpenH264API;
 use openh264::decoder::Decoder;
 use openh264::encoder::{Encoder, EncoderConfig};
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
-use openh264::OpenH264API;
 
 pub struct H264Encoder {
     encoder: Encoder,

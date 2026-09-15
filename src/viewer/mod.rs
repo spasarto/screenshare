@@ -1,7 +1,7 @@
+use crate::CliArgs;
 use crate::app::SessionEvent;
 use crate::capture::picker::{self, WindowInfo};
 use crate::transport::{ConnState, SharedConnState};
-use crate::CliArgs;
 use egui::TextureHandle;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;

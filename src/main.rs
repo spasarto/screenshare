@@ -62,7 +62,9 @@ fn main() -> Result<()> {
     // appears, with no setup screen in between to type a code into — so
     // without --pin there's no way the session code ever reaches the app.
     if args.client && args.process.is_some() && args.pin.is_none() {
-        anyhow::bail!("--client --process requires --pin (there's no setup screen to enter it once auto-start begins)");
+        anyhow::bail!(
+            "--client --process requires --pin (there's no setup screen to enter it once auto-start begins)"
+        );
     }
 
     let icon = {

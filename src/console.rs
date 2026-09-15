@@ -7,7 +7,7 @@ const STD_OUTPUT_HANDLE: u32 = u32::MAX - 10; // (DWORD)-11
 const STD_ERROR_HANDLE: u32 = u32::MAX - 11; // (DWORD)-12
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn AllocConsole() -> i32;
     fn FreeConsole() -> i32;
     fn GetConsoleWindow() -> *mut c_void;

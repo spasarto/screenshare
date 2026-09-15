@@ -18,7 +18,13 @@ pub struct Frame {
 ///
 /// Building the output row by row from the source's real stride (`src_w`) rather
 /// than truncating the source buffer avoids shearing when `src_w` is odd.
-pub fn scale_bgra(data: &[u8], src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8>) {
+pub fn scale_bgra(
+    data: &[u8],
+    src_w: u32,
+    src_h: u32,
+    max_w: u32,
+    max_h: u32,
+) -> (u32, u32, Vec<u8>) {
     let scale = (max_w as f64 / src_w as f64)
         .min(max_h as f64 / src_h as f64)
         .min(1.0);
