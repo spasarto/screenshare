@@ -1,3 +1,6 @@
+mod theme;
+mod widgets;
+
 use crate::CliArgs;
 use crate::app::SessionEvent;
 use crate::capture::picker::{self, WindowInfo};
@@ -5,6 +8,11 @@ use crate::transport::{ConnState, SharedConnState};
 use egui::TextureHandle;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+use widgets::StatusKind;
+
+/// Fixed width of the centred column every screen lays its content out in,
+/// so the logo, fields and buttons all share one axis.
+const COLUMN_WIDTH: f32 = 420.0;
 
 const SERVER_URL: &str = "https://screenshare.aghj.dev";
 
@@ -70,6 +78,8 @@ pub struct App {
 
 impl App {
     pub fn new(args: CliArgs, cc: &eframe::CreationContext) -> Self {
+        theme::install(&cc.egui_ctx);
+
         let windows = picker::enumerate_windows().unwrap_or_default();
         let has_windows = !windows.is_empty();
 
@@ -189,17 +199,21 @@ impl App {
         }
     }
 
+    /// The logo, at the same vertical offset on every screen that shows it.
+    fn show_logo_header(&self, ui: &mut egui::Ui) {
+        ui.add_space(theme::space::XXL);
+        ui.vertical_centered(|ui| self.show_logo(ui));
+        ui.add_space(theme::space::XL);
+    }
+
     fn show_setup(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                self.show_logo(ui);
-                ui.add_space(12.0);
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
 
-                ui.set_max_width(450.0);
-
+                widgets::section_header(ui, "Window");
+                ui.add_space(theme::space::XS);
                 ui.horizontal(|ui| {
-                    ui.label("Window:");
                     let selected_text = self
                         .selected_window
                         .and_then(|i| self.windows.get(i))
@@ -207,7 +221,7 @@ impl App {
                         .unwrap_or("Select a window...");
                     egui::ComboBox::from_id_salt("window_picker")
                         .selected_text(selected_text)
-                        .width(300.0)
+                        .width(COLUMN_WIDTH - 44.0)
                         .show_ui(ui, |ui| {
                             for (i, w) in self.windows.iter().enumerate() {
                                 ui.selectable_value(&mut self.selected_window, Some(i), &w.title);
@@ -233,7 +247,7 @@ impl App {
                     }
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(theme::space::MD);
 
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.role, Role::Create, "Create session");
@@ -241,7 +255,7 @@ impl App {
                 });
 
                 if self.role == Role::Join {
-                    ui.add_space(8.0);
+                    ui.add_space(theme::space::MD);
                     ui.horizontal(|ui| {
                         ui.label("Session code:");
                         ui.add(
@@ -253,24 +267,18 @@ impl App {
                 }
 
                 if let Some(err) = &self.setup_error {
-                    ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::RED, err.clone());
+                    ui.add_space(theme::space::XS);
+                    let color = theme::palette_for(ui).failed;
+                    ui.colored_label(color, err.clone());
                 }
 
-                ui.add_space(12.0);
+                ui.add_space(theme::space::MD);
 
                 let can_start = self.selected_window.is_some()
                     && (self.role == Role::Create
                         || crate::is_valid_pin(&self.session_code.trim().to_lowercase()));
 
-                if ui
-                    .scope(|ui| {
-                        ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
-                        ui.add_enabled(can_start, egui::Button::new("Start"))
-                    })
-                    .inner
-                    .clicked()
-                {
+                if widgets::primary_button(ui, can_start, "Start").clicked() {
                     self.handle_start();
                 }
             });
@@ -363,17 +371,19 @@ impl App {
 
     fn show_creating_session(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("Creating session...");
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label("Creating session...");
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
@@ -397,65 +407,71 @@ impl App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label(format!("Waiting for '{}' to start...", process_name));
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label(format!("Waiting for '{}' to start...", process_name));
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
 
     fn show_waiting_for_peer(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                self.show_logo(ui);
-                ui.add_space(20.0);
-                ui.heading("Session Created");
-                ui.add_space(20.0);
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.heading("Session Created");
+                    ui.add_space(theme::space::LG);
 
-                ui.label("Share this code with your peer:");
-                ui.add_space(12.0);
+                    ui.label("Share this code with your peer:");
+                    ui.add_space(theme::space::MD);
 
-                ui.label(
-                    egui::RichText::new(&self.session_code)
-                        .size(48.0)
-                        .monospace()
-                        .strong(),
-                );
+                    ui.label(
+                        egui::RichText::new(&self.session_code)
+                            .size(theme::size::HERO)
+                            .monospace()
+                            .strong(),
+                    );
 
-                ui.add_space(20.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("Waiting for peer to join...");
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+                    ui.add_space(theme::space::LG);
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label("Waiting for peer to join...");
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
 
     fn show_joining(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("Joining session...");
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label("Joining session...");
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
@@ -496,29 +512,29 @@ impl App {
             .unwrap_or(ConnState::Connecting);
 
         egui::Panel::bottom("status_bar").show(ui, |ui| {
+            ui.add_space(theme::space::XS);
             ui.horizontal(|ui| {
-                let (color, text) = match state {
-                    ConnState::Connected => (egui::Color32::GREEN, "Connected"),
-                    ConnState::Reconnecting => {
-                        (egui::Color32::from_rgb(255, 165, 0), "Reconnecting...")
-                    }
-                    ConnState::Failed => (egui::Color32::RED, "Disconnected"),
-                    ConnState::Connecting => (egui::Color32::YELLOW, "Connecting..."),
+                let (kind, text) = match state {
+                    ConnState::Connected => (StatusKind::Positive, "Connected"),
+                    ConnState::Reconnecting => (StatusKind::Warning, "Reconnecting..."),
+                    ConnState::Failed => (StatusKind::Negative, "Disconnected"),
+                    ConnState::Connecting => (StatusKind::Warning, "Connecting..."),
                 };
-                ui.colored_label(color, text);
+                widgets::status_pill(ui, kind, text);
 
                 if let Some(ice) = self.conn_state.as_ref().and_then(|cs| cs.get_ice_info()) {
-                    ui.separator();
                     if ice.relay {
-                        ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "Relayed (TURN)");
+                        widgets::status_pill(ui, StatusKind::Neutral, "Relayed (TURN)");
                     } else {
-                        ui.colored_label(
-                            egui::Color32::GREEN,
+                        widgets::status_pill(
+                            ui,
+                            StatusKind::Positive,
                             format!("Direct ({})", ice.local_type),
                         );
                     }
                 }
             });
+            ui.add_space(theme::space::XS);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -542,17 +558,19 @@ impl App {
 
     fn show_error(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(30.0);
-                ui.colored_label(egui::Color32::RED, "Error");
-                ui.add_space(10.0);
-                ui.label(&self.error_message);
-                ui.add_space(20.0);
-                if ui.button("Try again").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    widgets::status_pill(ui, StatusKind::Negative, "Error");
+                    ui.add_space(theme::space::SM);
+                    ui.label(&self.error_message);
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::primary_button(ui, true, "Try again").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
