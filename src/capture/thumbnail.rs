@@ -8,8 +8,17 @@
 //! session-per-item lifecycle is built for a single long-lived capture, not
 //! for cheaply refreshing a grid of N thumbnails on a timer. `PrintWindow`
 //! is a single synchronous call, which is what a periodic refresh wants.
+//!
+//! "Synchronous" is the catch, and why [`Service`] exists: `PrintWindow`
+//! blocks until the *target* process's message loop re-renders itself
+//! through DWM, measured at 20-36 ms per window on a fast machine and
+//! bounded by the other app, not by local CPU. Calling it inline on the
+//! render thread for a grid of windows stalls the UI for most of a second
+//! at a time and leaves our own window undraggable, so the waiting happens
+//! on a worker thread and the render thread only uploads finished pixels.
 
 use std::ffi::c_void;
+use std::sync::mpsc;
 use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -23,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, ICONINFO, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
     WM_GETICON,
 };
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32,
@@ -34,6 +44,126 @@ pub struct CapturedImage {
     pub height: u32,
     /// Tightly packed, top-down, straight-alpha RGBA8.
     pub rgba: Vec<u8>,
+}
+
+/// Longest edge of a picker thumbnail. Tiles are ~156x72 logical px, so
+/// this leaves headroom for a HiDPI scale factor without uploading a
+/// window-sized texture per tile.
+pub const THUMB_MAX_DIM: u32 = 320;
+
+/// One tile's worth of work. `PrintWindow` is retried every cycle — a live
+/// still is the whole point — but the icon fallback is one-shot: once a
+/// tile has an icon there's no reason to pay `WM_GETICON`'s timeouts and a
+/// shell-icon lookup again, so the caller clears `need_icon` once it has one.
+pub struct Request {
+    /// Raw `HWND` as a `usize`, because `HWND` isn't `Send`. Only ever
+    /// turned back into a handle on the worker.
+    pub hwnd: usize,
+    pub need_icon: bool,
+}
+
+pub enum Art {
+    Thumb(CapturedImage),
+    Icon(CapturedImage),
+}
+
+pub struct Ready {
+    pub hwnd: usize,
+    pub art: Art,
+}
+
+enum Msg {
+    Ready(Ready),
+    BatchDone,
+}
+
+/// Captures picker thumbnails off the render thread.
+///
+/// Requests are batched per refresh tick and results stream back as each
+/// window finishes, so tiles fill in progressively instead of appearing all
+/// at once after the whole batch. A batch is only ever sent when the
+/// previous one has finished ([`Service::is_busy`]), which keeps a slow
+/// desktop from queueing refreshes faster than it can serve them.
+pub struct Service {
+    req_tx: mpsc::Sender<Vec<Request>>,
+    res_rx: mpsc::Receiver<Msg>,
+    in_flight: bool,
+}
+
+impl Service {
+    pub fn new() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<Vec<Request>>();
+        let (res_tx, res_rx) = mpsc::channel::<Msg>();
+        std::thread::Builder::new()
+            .name("picker-thumbs".into())
+            .spawn(move || worker(&req_rx, &res_tx))
+            .expect("Failed to spawn thumbnail worker thread");
+        Self {
+            req_tx,
+            res_rx,
+            in_flight: false,
+        }
+    }
+
+    /// True while the worker still owes results for the last batch.
+    pub fn is_busy(&self) -> bool {
+        self.in_flight
+    }
+
+    pub fn request(&mut self, batch: Vec<Request>) {
+        if batch.is_empty() {
+            return;
+        }
+        if self.req_tx.send(batch).is_ok() {
+            self.in_flight = true;
+        }
+    }
+
+    /// Non-blocking: hands back whatever finished since the last call.
+    /// Safe to call every frame.
+    pub fn poll(&mut self) -> Vec<Ready> {
+        let mut out = Vec::new();
+        while let Ok(msg) = self.res_rx.try_recv() {
+            match msg {
+                Msg::Ready(ready) => out.push(ready),
+                Msg::BatchDone => self.in_flight = false,
+            }
+        }
+        out
+    }
+}
+
+fn worker(req_rx: &mpsc::Receiver<Vec<Request>>, res_tx: &mpsc::Sender<Msg>) {
+    // `SHGetFileInfoW`'s icon lookup (the fallback in `window_icon`) needs a
+    // COM-initialised thread; the render thread gets this from winit, this
+    // one has to ask for it. A failure here only costs us shell icons.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+
+    // Both channels disconnect when the picker is dropped, which is how this
+    // thread exits.
+    while let Ok(batch) = req_rx.recv() {
+        for req in batch {
+            let hwnd = req.hwnd as *mut c_void;
+            let art = match capture_window(hwnd, THUMB_MAX_DIM) {
+                Some(img) => Some(Art::Thumb(img)),
+                None if req.need_icon => window_icon(hwnd).map(Art::Icon),
+                None => None,
+            };
+            if let Some(art) = art
+                && res_tx
+                    .send(Msg::Ready(Ready {
+                        hwnd: req.hwnd,
+                        art,
+                    }))
+                    .is_err()
+            {
+                return;
+            }
+        }
+        if res_tx.send(Msg::BatchDone).is_err() {
+            return;
+        }
+    }
 }
 
 /// Grab a still of `hwnd`'s current contents via `PrintWindow`, downscaled

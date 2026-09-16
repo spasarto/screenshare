@@ -11,10 +11,10 @@ use crate::capture::picker::{self, MonitorInfo, WindowInfo};
 use crate::capture::thumbnail;
 use crate::viewer::{theme, widgets};
 use egui::{Color32, ColorImage, Rect, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const THUMB_MAX_DIM: u32 = 320;
 const TILE_WIDTH: f32 = 156.0;
 const ART_HEIGHT: f32 = 72.0;
 
@@ -33,7 +33,12 @@ struct TileArt {
 pub struct PickerGrid {
     windows: Vec<WindowInfo>,
     monitors: Vec<MonitorInfo>,
-    window_art: Vec<TileArt>,
+    /// Keyed by raw `HWND` rather than by index into `windows`, so art
+    /// survives the re-enumeration each refresh does — indices shift as
+    /// windows open and close, and rebuilding this per cycle is what used to
+    /// throw every texture away (and re-pay the icon lookup) every 2 s.
+    window_art: HashMap<usize, TileArt>,
+    thumbs: thumbnail::Service,
     selection: Option<Selection>,
     search: String,
     last_refresh: Option<Instant>,
@@ -44,12 +49,18 @@ impl PickerGrid {
         let mut grid = Self {
             windows: Vec::new(),
             monitors: picker::enumerate_monitors(),
-            window_art: Vec::new(),
+            window_art: HashMap::new(),
+            thumbs: thumbnail::Service::new(),
             selection: None,
             search: String::new(),
             last_refresh: None,
         };
+        // Populate the list (so the first frame has tiles and a selection to
+        // draw) but leave `last_refresh` clear, so that first frame also
+        // fires the capture request instead of sitting on an empty grid for
+        // a full `REFRESH_INTERVAL` before asking for any art.
         grid.refresh_window_list();
+        grid.last_refresh = None;
         grid
     }
 
@@ -98,7 +109,12 @@ impl PickerGrid {
         };
 
         self.windows = picker::enumerate_windows().unwrap_or_default();
-        self.window_art = self.windows.iter().map(|_| TileArt::default()).collect();
+
+        // Keep the art we already have and drop only what closed, so a
+        // window that's still open keeps showing its last still (and its
+        // one-shot icon) instead of blanking out once every interval.
+        let live: HashSet<usize> = self.windows.iter().map(window_key).collect();
+        self.window_art.retain(|hwnd, _| live.contains(hwnd));
 
         if let Some(prev) = prev_hwnd
             && let Some(i) = self.windows.iter().position(|w| w.window == prev)
@@ -129,61 +145,79 @@ impl PickerGrid {
     /// session) without needing an `egui::Context` on hand.
     pub fn refresh_list(&mut self) {
         self.refresh_window_list();
+        // Returning to the picker should show current stills, not whatever
+        // was on screen when the session started.
+        self.force_refresh();
     }
 
-    /// Re-enumerate windows and immediately recapture every tile's art,
-    /// rather than waiting for the next throttled tick. Used by the
-    /// explicit Refresh button so it doesn't feel like a no-op.
-    pub fn refresh_with_thumbnails(&mut self, ctx: &egui::Context) {
-        self.refresh_window_list();
-        self.refresh_thumbnails(ctx);
+    /// Make the next frame re-enumerate and re-request art instead of
+    /// waiting out the interval. Used by the explicit Refresh button, which
+    /// can't do the work itself: which tiles are on screen isn't known until
+    /// the grid below it has been laid out.
+    fn force_refresh(&mut self) {
+        self.last_refresh = None;
     }
 
-    /// Call once per frame while the picker is visible.
-    pub fn tick(&mut self, ctx: &egui::Context) {
-        let due = self
-            .last_refresh
-            .is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
-        if due {
-            self.refresh_window_list();
-            self.refresh_thumbnails(ctx);
-        }
-    }
-
-    fn refresh_thumbnails(&mut self, ctx: &egui::Context) {
-        for (i, w) in self.windows.iter().enumerate() {
-            let hwnd = w.window.as_raw_hwnd();
-            if let Some(img) = thumbnail::capture_window(hwnd, THUMB_MAX_DIM) {
-                let color = ColorImage::from_rgba_unmultiplied(
-                    [img.width as usize, img.height as usize],
-                    &img.rgba,
-                );
-                self.window_art[i].thumb = Some(ctx.load_texture(
-                    format!("picker-thumb-{i}"),
-                    color,
-                    TextureOptions::LINEAR,
-                ));
-            } else if self.window_art[i].icon.is_none()
-                && let Some(img) = thumbnail::window_icon(hwnd)
-            {
-                let color = ColorImage::from_rgba_unmultiplied(
-                    [img.width as usize, img.height as usize],
-                    &img.rgba,
-                );
-                self.window_art[i].icon = Some(ctx.load_texture(
-                    format!("picker-icon-{i}"),
-                    color,
-                    TextureOptions::LINEAR,
-                ));
+    /// Upload whatever the worker finished since the last frame. Cheap
+    /// enough to call every frame: a non-blocking drain plus an in-place
+    /// texture update per finished tile.
+    fn pump(&mut self, ctx: &egui::Context) {
+        for ready in self.thumbs.poll() {
+            let art = self.window_art.entry(ready.hwnd).or_default();
+            let (slot, prefix, img) = match ready.art {
+                thumbnail::Art::Thumb(img) => (&mut art.thumb, "picker-thumb", img),
+                thumbnail::Art::Icon(img) => (&mut art.icon, "picker-icon", img),
+            };
+            let color = ColorImage::from_rgba_unmultiplied(
+                [img.width as usize, img.height as usize],
+                &img.rgba,
+            );
+            match slot {
+                // `load_texture` allocates a fresh GPU texture and drops the
+                // old one; on a 2 s timer that's a free/alloc/upload cycle
+                // per tile for pixels that could have gone into the texture
+                // already sitting there.
+                Some(tex) => tex.set(color, TextureOptions::LINEAR),
+                None => {
+                    *slot = Some(ctx.load_texture(
+                        format!("{prefix}-{:x}", ready.hwnd),
+                        color,
+                        TextureOptions::LINEAR,
+                    ))
+                }
             }
         }
+    }
+
+    /// Queue art for exactly the tiles that are on screen.
+    ///
+    /// Capturing the whole enumeration was most of the old cost: the grid
+    /// draws at most `max_tiles`, so on a busy desktop the majority of every
+    /// refresh was `PrintWindow` calls for windows filtered out by search or
+    /// past the tile budget — work nobody could see.
+    fn request_captures(&mut self, visible: &[usize]) {
+        let batch: Vec<thumbnail::Request> = visible
+            .iter()
+            .filter_map(|&i| self.windows.get(i))
+            .map(|w| {
+                let hwnd = window_key(w);
+                thumbnail::Request {
+                    hwnd,
+                    need_icon: self
+                        .window_art
+                        .get(&hwnd)
+                        .is_none_or(|art| art.icon.is_none()),
+                }
+            })
+            .collect();
+        self.thumbs.request(batch);
     }
 
     /// `max_tiles` bounds how many tiles (monitors + windows) get drawn, so
     /// the caller can trade grid rows for whatever else it needs to fit in
     /// the window's fixed height (e.g. the Join code-entry row).
     pub fn show(&mut self, ui: &mut egui::Ui, max_tiles: usize) {
-        self.tick(ui.ctx());
+        self.pump(ui.ctx());
 
         ui.horizontal(|ui| {
             let avail = ui.available_width();
@@ -193,11 +227,22 @@ impl PickerGrid {
                     .desired_width(avail - 96.0),
             );
             if widgets::secondary_button(ui, "Refresh").clicked() {
-                self.refresh_with_thumbnails(ui.ctx());
+                self.force_refresh();
             }
         });
 
         ui.add_space(theme::space::SM);
+
+        // Holding off while the worker is still busy is what bounds the cost
+        // on a desktop slow enough that a batch outlasts the interval: the
+        // refresh rate degrades instead of the queue growing without limit.
+        let due = !self.thumbs.is_busy()
+            && self
+                .last_refresh
+                .is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
+        if due {
+            self.refresh_window_list();
+        }
 
         if !self.has_targets() {
             self.show_empty_state(ui);
@@ -219,6 +264,11 @@ impl PickerGrid {
         let matches: Vec<usize> = (0..self.windows.len())
             .filter(|&i| search.is_empty() || self.windows[i].title.to_lowercase().contains(&search))
             .collect();
+
+        if due {
+            let visible: Vec<usize> = matches.iter().take(window_budget).copied().collect();
+            self.request_captures(&visible);
+        }
 
         if self.windows.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -292,7 +342,7 @@ impl PickerGrid {
                     );
                     ui.add_space(theme::space::SM);
                     if widgets::secondary_button(ui, "Refresh").clicked() {
-                        self.refresh_with_thumbnails(ui.ctx());
+                        self.force_refresh();
                     }
                 });
             });
@@ -325,9 +375,10 @@ impl PickerGrid {
     fn window_tile(&mut self, ui: &mut egui::Ui, idx: usize) {
         let selected = self.selection == Some(Selection::Window(idx));
         let title = self.windows[idx].title.clone();
-        let art = &self.window_art[idx];
-        let thumb = art.thumb.clone();
-        let icon = art.icon.clone();
+        let (thumb, icon) = match self.window_art.get(&window_key(&self.windows[idx])) {
+            Some(art) => (art.thumb.clone(), art.icon.clone()),
+            None => (None, None),
+        };
 
         let clicked = tile_frame(ui, selected, |ui| {
             let p = theme::palette_for(ui);
@@ -359,6 +410,13 @@ impl PickerGrid {
             self.selection = Some(Selection::Window(idx));
         }
     }
+}
+
+/// Identity for the art cache. The raw `HWND` as a `usize` — the same key
+/// the capture worker echoes back, and stable across re-enumeration in a way
+/// a position in `windows` is not.
+fn window_key(w: &WindowInfo) -> usize {
+    w.window.as_raw_hwnd() as usize
 }
 
 /// A clickable, selectable card. Returns whether it was clicked this frame.
