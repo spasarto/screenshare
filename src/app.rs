@@ -1,4 +1,5 @@
 use crate::capture;
+use crate::capture::CaptureTarget;
 use crate::codec::{H264Decoder, H264Encoder};
 use crate::signaling_server::SignalingServer;
 use crate::transport::framing::IncomingMessage;
@@ -8,7 +9,6 @@ use crate::viewer::DecodedFrame;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
-use windows_capture::window::Window;
 
 const TARGET_WIDTH: u32 = 1280;
 const TARGET_HEIGHT: u32 = 720;
@@ -35,7 +35,7 @@ pub enum SessionEvent {
 /// signaling server's poll timeouts.
 pub fn spawn_offerer(
     server_url: String,
-    window: Window,
+    target: CaptureTarget,
     custom_pin: Option<String>,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -45,7 +45,7 @@ pub fn spawn_offerer(
         .spawn(move || {
             match run_offerer(
                 server_url,
-                window,
+                target,
                 custom_pin.as_deref(),
                 &event_tx,
                 cancel_rx,
@@ -62,7 +62,7 @@ pub fn spawn_offerer(
 /// Spawn the answerer session in a background thread. See `spawn_offerer` for `cancel_rx`.
 pub fn spawn_answerer(
     server_url: String,
-    window: Window,
+    target: CaptureTarget,
     session_code: String,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -70,7 +70,7 @@ pub fn spawn_answerer(
     std::thread::Builder::new()
         .name("session-answerer".into())
         .spawn(move || {
-            match run_answerer(server_url, window, &session_code, &event_tx, cancel_rx) {
+            match run_answerer(server_url, target, &session_code, &event_tx, cancel_rx) {
                 Ok(()) | Err(SessionError::Cancelled) => {}
                 Err(SessionError::Other(e)) => {
                     let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
@@ -101,7 +101,7 @@ impl From<anyhow::Error> for SessionError {
 
 fn run_offerer(
     server_url: String,
-    window: Window,
+    target: CaptureTarget,
     custom_pin: Option<&str>,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -169,7 +169,7 @@ fn run_offerer(
 
     tracing::info!("Offerer signaling complete, starting media threads");
     start_media_threads(
-        window,
+        target,
         capture_tx,
         capture_rx,
         encoded_tx,
@@ -194,7 +194,7 @@ fn run_offerer(
 
 fn run_answerer(
     server_url: String,
-    window: Window,
+    target: CaptureTarget,
     session_code: &str,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -258,7 +258,7 @@ fn run_answerer(
 
     tracing::info!("Answerer signaling complete, starting media threads");
     start_media_threads(
-        window,
+        target,
         capture_tx,
         capture_rx,
         encoded_tx,
@@ -282,7 +282,7 @@ fn run_answerer(
 
 #[allow(clippy::too_many_arguments)]
 fn start_media_threads(
-    window: Window,
+    target: CaptureTarget,
     capture_tx: std::sync::mpsc::SyncSender<capture::Frame>,
     capture_rx: std::sync::mpsc::Receiver<capture::Frame>,
     encoded_tx: mpsc::Sender<Vec<u8>>,
@@ -291,7 +291,7 @@ fn start_media_threads(
     frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
     conn_state: SharedConnState,
 ) -> Result<()> {
-    capture::wgc::start_capture(window, capture_tx)?;
+    capture::wgc::start_capture(target, capture_tx)?;
 
     std::thread::Builder::new()
         .name("encoder".into())

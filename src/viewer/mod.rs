@@ -1,10 +1,24 @@
+mod picker_grid;
+mod theme;
+mod widgets;
+
 use crate::CliArgs;
 use crate::app::SessionEvent;
-use crate::capture::picker::{self, WindowInfo};
+use crate::capture::picker;
 use crate::transport::{ConnState, SharedConnState};
 use egui::TextureHandle;
+use picker_grid::PickerGrid;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+use widgets::StatusKind;
+
+/// Fixed width of the centred column every screen lays its content out in,
+/// so the logo, fields and buttons all share one axis.
+const COLUMN_WIDTH: f32 = 420.0;
+
+/// Wider column used only by the two setup steps that need room for a
+/// two-card choice or a tile grid.
+const WIDE_COLUMN_WIDTH: f32 = 640.0;
 
 const SERVER_URL: &str = "https://screenshare.aghj.dev";
 
@@ -18,6 +32,15 @@ pub struct DecodedFrame {
 enum Role {
     Create,
     Join,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SetupStep {
+    /// "Start a session" vs. "Join a session" — the fork the old UI never
+    /// named, even though both sides always end up sharing a window.
+    ChooseIntent,
+    /// Pick what to share (and, when joining, enter the peer's code).
+    PickTarget,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -35,11 +58,19 @@ pub struct App {
     phase: Phase,
 
     // Setup
-    windows: Vec<WindowInfo>,
-    selected_window: Option<usize>,
+    setup_step: SetupStep,
+    /// True when the role came from `--server`/`--client` rather than the
+    /// ChooseIntent screen — in that case there's no intent screen to go
+    /// "back" to.
+    role_fixed_by_cli: bool,
+    picker: PickerGrid,
     role: Role,
+    code_digits: String,
+    code_letters: String,
+    /// The offerer's own generated code (for display on WaitingForPeer) or a
+    /// CLI-supplied `--pin`. Not the same as the digits/letters the user is
+    /// actively typing into the Join fields.
     session_code: String,
-    setup_error: Option<String>,
 
     // CLI auto-start
     cli_process: Option<String>,
@@ -70,29 +101,39 @@ pub struct App {
 
 impl App {
     pub fn new(args: CliArgs, cc: &eframe::CreationContext) -> Self {
-        let windows = picker::enumerate_windows().unwrap_or_default();
-        let has_windows = !windows.is_empty();
+        theme::install(&cc.egui_ctx);
 
         // Determine role from CLI flags, defaulting to Create
+        let role_fixed_by_cli = args.server || args.client;
         let role = if args.client {
             Role::Join
         } else {
             Role::Create
         };
 
-        // Pre-fill session code from --pin for client mode
-        let session_code = if args.client {
-            args.pin.clone().unwrap_or_default()
-        } else {
-            String::new()
+        // Pre-fill the code fields from --pin for client mode, split into
+        // the same digits/letters groups the Join screen edits.
+        let (code_digits, code_letters) = match (args.client, &args.pin) {
+            (true, Some(pin)) if pin.len() >= 6 => {
+                (pin[..6].to_string(), pin[6..].to_string())
+            }
+            (true, Some(pin)) => (pin.clone(), String::new()),
+            _ => (String::new(), String::new()),
         };
 
-        // Decide starting phase: if we have a role flag + process, wait for process
-        let has_role = args.server || args.client;
-        let phase = if has_role && args.process.is_some() {
+        // Decide starting phase/step: if we have a role flag + process, wait
+        // for the process; if we just have a role flag, skip straight past
+        // the "what do you want to do" screen since the CLI already answered it.
+        let has_process = args.process.is_some();
+        let phase = if role_fixed_by_cli && has_process {
             Phase::WaitingForProcess
         } else {
             Phase::Setup
+        };
+        let setup_step = if role_fixed_by_cli {
+            SetupStep::PickTarget
+        } else {
+            SetupStep::ChooseIntent
         };
 
         let logo_texture = {
@@ -111,11 +152,13 @@ impl App {
 
         Self {
             phase,
-            windows,
-            selected_window: if has_windows { Some(0) } else { None },
+            setup_step,
+            role_fixed_by_cli,
+            picker: PickerGrid::new(),
             role,
-            session_code,
-            setup_error: None,
+            code_digits,
+            code_letters,
+            session_code: String::new(),
             cli_process: args.process,
             cli_pin: if args.server { args.pin } else { None },
             last_process_poll: None,
@@ -128,6 +171,56 @@ impl App {
             session_cancel: None,
             error_message: String::new(),
         }
+    }
+
+    /// The code the user has typed into the Join fields, normalised and
+    /// combined (digits then letters, matching the wire format).
+    fn join_code(&self) -> String {
+        format!("{}{}", self.code_digits, self.code_letters)
+    }
+
+    /// Keeps the two code-entry fields honest as the user types or pastes:
+    /// strips anything that isn't alphanumeric, forces lowercase, and
+    /// re-splits into a digit run followed by a letter run so pasting the
+    /// full code into either box (or typing a stray character into the
+    /// wrong one) still lands in the right place.
+    fn normalize_code_fields(&mut self) {
+        let raw: String = format!("{}{}", self.code_digits, self.code_letters)
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).take(6).collect();
+        let letters: String = raw
+            .chars()
+            .skip(digits.len())
+            .filter(|c| c.is_ascii_alphabetic())
+            .take(4)
+            .collect();
+        self.code_digits = digits;
+        self.code_letters = letters;
+    }
+
+    fn can_start(&self) -> bool {
+        self.picker.selected_capture_target().is_some()
+            && (self.role == Role::Create || crate::is_valid_pin(&self.join_code()))
+    }
+
+    /// Explains why Start is disabled (or nothing, once it isn't) instead of
+    /// leaving a greyed-out button to speak for itself.
+    fn start_hint(&self) -> Option<String> {
+        if self.picker.selected_capture_target().is_none() {
+            return Some("Select something to share".to_string());
+        }
+        if self.role == Role::Join {
+            let typed = self.code_digits.chars().count() + self.code_letters.chars().count();
+            let remaining = 10usize.saturating_sub(typed);
+            if remaining > 0 {
+                let plural = if remaining == 1 { "" } else { "s" };
+                return Some(format!("{remaining} more character{plural} needed"));
+            }
+        }
+        None
     }
 
     /// Abandon whatever session is in flight (if any) and return to the
@@ -144,16 +237,9 @@ impl App {
         self.frame_buffer = None;
         self.texture = None;
         self.conn_state = None;
-        self.setup_error = None;
-        if self.windows.is_empty() {
-            self.windows = picker::enumerate_windows().unwrap_or_default();
-            self.selected_window = if self.windows.is_empty() {
-                None
-            } else {
-                Some(0)
-            };
-        }
+        self.picker.refresh_list();
         self.phase = Phase::Setup;
+        self.setup_step = SetupStep::PickTarget;
     }
 
     fn process_events(&mut self) {
@@ -189,102 +275,137 @@ impl App {
         }
     }
 
+    /// The logo, at the same vertical offset on every screen that shows it.
+    fn show_logo_header(&self, ui: &mut egui::Ui) {
+        ui.add_space(theme::space::XXL);
+        ui.vertical_centered(|ui| self.show_logo(ui));
+        ui.add_space(theme::space::XL);
+    }
+
     fn show_setup(&mut self, ui: &mut egui::Ui) {
+        match self.setup_step {
+            SetupStep::ChooseIntent => self.show_choose_intent(ui),
+            SetupStep::PickTarget => self.show_pick_target(ui),
+        }
+    }
+
+    fn show_choose_intent(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                self.show_logo(ui);
-                ui.add_space(12.0);
+            widgets::centered_column(ui, WIDE_COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
 
-                ui.set_max_width(450.0);
+                ui.vertical_centered(|ui| {
+                    let p = theme::palette_for(ui);
+                    ui.colored_label(
+                        p.ink_2,
+                        "Both sides share their screen — pick where you're starting.",
+                    );
+                });
+                ui.add_space(theme::space::LG);
 
-                ui.horizontal(|ui| {
-                    ui.label("Window:");
-                    let selected_text = self
-                        .selected_window
-                        .and_then(|i| self.windows.get(i))
-                        .map(|w| w.title.as_str())
-                        .unwrap_or("Select a window...");
-                    egui::ComboBox::from_id_salt("window_picker")
-                        .selected_text(selected_text)
-                        .width(300.0)
-                        .show_ui(ui, |ui| {
-                            for (i, w) in self.windows.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_window, Some(i), &w.title);
-                            }
-                        });
-                    if ui
-                        .button("↻")
-                        .on_hover_text("Refresh window list")
-                        .clicked()
+                ui.columns(2, |columns| {
+                    if widgets::choice_card(
+                        &mut columns[0],
+                        "Start a session",
+                        "Pick something to share and get a code to send your peer. \
+                         They'll share their screen with you too.",
+                    )
+                    .clicked()
                     {
-                        self.windows = picker::enumerate_windows().unwrap_or_default();
-                        if self
-                            .selected_window
-                            .map(|i| i >= self.windows.len())
-                            .unwrap_or(true)
-                        {
-                            self.selected_window = if self.windows.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            };
-                        }
+                        self.role = Role::Create;
+                        self.setup_step = SetupStep::PickTarget;
+                    }
+
+                    if widgets::choice_card(
+                        &mut columns[1],
+                        "Join a session",
+                        "Enter a code you were given, then pick what you'll share back.",
+                    )
+                    .clicked()
+                    {
+                        self.role = Role::Join;
+                        self.setup_step = SetupStep::PickTarget;
                     }
                 });
-
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.role, Role::Create, "Create session");
-                    ui.radio_value(&mut self.role, Role::Join, "Join session");
-                });
-
-                if self.role == Role::Join {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Session code:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.session_code)
-                                .desired_width(120.0)
-                                .hint_text("e.g. 482917bcdq"),
-                        );
-                    });
-                }
-
-                if let Some(err) = &self.setup_error {
-                    ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::RED, err.clone());
-                }
-
-                ui.add_space(12.0);
-
-                let can_start = self.selected_window.is_some()
-                    && (self.role == Role::Create
-                        || crate::is_valid_pin(&self.session_code.trim().to_lowercase()));
-
-                if ui
-                    .scope(|ui| {
-                        ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
-                        ui.add_enabled(can_start, egui::Button::new("Start"))
-                    })
-                    .inner
-                    .clicked()
-                {
-                    self.handle_start();
-                }
             });
         });
     }
 
-    fn handle_start(&mut self) {
-        let Some(idx) = self.selected_window else {
-            self.setup_error = Some("Select a window to share".into());
-            return;
-        };
+    fn show_pick_target(&mut self, ui: &mut egui::Ui) {
+        self.normalize_code_fields();
 
-        let Some(window) = self.windows.get(idx).map(|w| w.window) else {
-            self.setup_error = Some("Invalid window selection".into());
+        egui::CentralPanel::default().show(ui, |ui| {
+            widgets::centered_column(ui, WIDE_COLUMN_WIDTH, |ui| {
+                ui.add_space(theme::space::SM);
+
+                ui.horizontal(|ui| {
+                    if !self.role_fixed_by_cli && widgets::secondary_button(ui, "< Back").clicked() {
+                        self.setup_step = SetupStep::ChooseIntent;
+                    }
+                    ui.add_space(theme::space::SM);
+                    ui.heading(match self.role {
+                        Role::Create => "Start a session",
+                        Role::Join => "Join a session",
+                    });
+                });
+                ui.add_space(theme::space::SM);
+
+                widgets::section_header(ui, "What do you want to share?");
+                ui.add_space(theme::space::XS);
+                // Join also needs room for the code-entry row below the
+                // grid, so it gets one fewer tile row than Create.
+                let max_tiles = if self.role == Role::Join { 4 } else { 8 };
+                self.picker.show(ui, max_tiles);
+
+                if self.role == Role::Join {
+                    ui.add_space(theme::space::SM);
+                    widgets::section_header(ui, "Session code");
+                    ui.add_space(theme::space::XS);
+                    self.show_code_entry(ui);
+                }
+
+                ui.add_space(theme::space::MD);
+
+                let can_start = self.can_start();
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, can_start, "Start").clicked() {
+                        self.handle_start();
+                    }
+                    if let Some(hint) = self.start_hint() {
+                        ui.add_space(theme::space::SM);
+                        let p = theme::palette_for(ui);
+                        ui.colored_label(p.ink_3, hint);
+                    }
+                });
+            });
+        });
+    }
+
+    fn show_code_entry(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette_for(ui);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.code_digits)
+                    .desired_width(104.0)
+                    .font(egui::FontId::monospace(theme::size::LG))
+                    .hint_text("000000"),
+            );
+            ui.label(egui::RichText::new("\u{00B7}").size(theme::size::LG).color(p.ink_3));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.code_letters)
+                    .desired_width(72.0)
+                    .font(egui::FontId::monospace(theme::size::LG))
+                    .hint_text("aaaa"),
+            );
+        });
+    }
+
+    fn handle_start(&mut self) {
+        // The Start button is disabled unless `can_start()` holds, so
+        // reaching here with no target or an invalid code shouldn't happen;
+        // treat it as a no-op rather than surfacing an error for a state
+        // the UI already prevents.
+        let Some(target) = self.picker.selected_capture_target() else {
             return;
         };
 
@@ -297,7 +418,7 @@ impl App {
 
                 crate::app::spawn_offerer(
                     SERVER_URL.to_string(),
-                    window,
+                    target,
                     self.cli_pin.clone(),
                     event_tx,
                     cancel_rx,
@@ -305,10 +426,8 @@ impl App {
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
-                let code = self.session_code.trim().to_lowercase();
+                let code = self.join_code();
                 if !crate::is_valid_pin(&code) {
-                    self.setup_error =
-                        Some("Enter a valid session code (6 digits + 4 letters)".into());
                     return;
                 }
 
@@ -317,13 +436,7 @@ impl App {
                 let (cancel_tx, cancel_rx) = watch::channel(false);
                 self.session_cancel = Some(cancel_tx);
 
-                crate::app::spawn_answerer(
-                    SERVER_URL.to_string(),
-                    window,
-                    code,
-                    event_tx,
-                    cancel_rx,
-                );
+                crate::app::spawn_answerer(SERVER_URL.to_string(), target, code, event_tx, cancel_rx);
                 self.phase = Phase::Joining;
             }
         }
@@ -331,6 +444,7 @@ impl App {
 
     /// Auto-start a session directly with a found window (used by WaitingForProcess phase).
     fn start_with_window(&mut self, window: windows_capture::window::Window) {
+        let target = crate::capture::CaptureTarget::Window(window);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         self.event_rx = Some(event_rx);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -340,7 +454,7 @@ impl App {
             Role::Create => {
                 crate::app::spawn_offerer(
                     SERVER_URL.to_string(),
-                    window,
+                    target,
                     self.cli_pin.clone(),
                     event_tx,
                     cancel_rx,
@@ -348,14 +462,8 @@ impl App {
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
-                let code = self.session_code.trim().to_lowercase();
-                crate::app::spawn_answerer(
-                    SERVER_URL.to_string(),
-                    window,
-                    code,
-                    event_tx,
-                    cancel_rx,
-                );
+                let code = self.join_code();
+                crate::app::spawn_answerer(SERVER_URL.to_string(), target, code, event_tx, cancel_rx);
                 self.phase = Phase::Joining;
             }
         }
@@ -363,17 +471,19 @@ impl App {
 
     fn show_creating_session(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("Creating session...");
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label("Creating session...");
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
@@ -397,65 +507,71 @@ impl App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label(format!("Waiting for '{}' to start...", process_name));
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label(format!("Waiting for '{}' to start...", process_name));
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
 
     fn show_waiting_for_peer(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                self.show_logo(ui);
-                ui.add_space(20.0);
-                ui.heading("Session Created");
-                ui.add_space(20.0);
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.heading("Session Created");
+                    ui.add_space(theme::space::LG);
 
-                ui.label("Share this code with your peer:");
-                ui.add_space(12.0);
+                    ui.label("Share this code with your peer:");
+                    ui.add_space(theme::space::MD);
 
-                ui.label(
-                    egui::RichText::new(&self.session_code)
-                        .size(48.0)
-                        .monospace()
-                        .strong(),
-                );
+                    ui.label(
+                        egui::RichText::new(&self.session_code)
+                            .size(theme::size::HERO)
+                            .monospace()
+                            .strong(),
+                    );
 
-                ui.add_space(20.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("Waiting for peer to join...");
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+                    ui.add_space(theme::space::LG);
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label("Waiting for peer to join...");
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
 
     fn show_joining(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("Joining session...");
-                ui.add_space(20.0);
-                if ui.button("Cancel").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::space::SM);
+                    ui.label("Joining session...");
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
@@ -496,29 +612,29 @@ impl App {
             .unwrap_or(ConnState::Connecting);
 
         egui::Panel::bottom("status_bar").show(ui, |ui| {
+            ui.add_space(theme::space::XS);
             ui.horizontal(|ui| {
-                let (color, text) = match state {
-                    ConnState::Connected => (egui::Color32::GREEN, "Connected"),
-                    ConnState::Reconnecting => {
-                        (egui::Color32::from_rgb(255, 165, 0), "Reconnecting...")
-                    }
-                    ConnState::Failed => (egui::Color32::RED, "Disconnected"),
-                    ConnState::Connecting => (egui::Color32::YELLOW, "Connecting..."),
+                let (kind, text) = match state {
+                    ConnState::Connected => (StatusKind::Positive, "Connected"),
+                    ConnState::Reconnecting => (StatusKind::Warning, "Reconnecting..."),
+                    ConnState::Failed => (StatusKind::Negative, "Disconnected"),
+                    ConnState::Connecting => (StatusKind::Warning, "Connecting..."),
                 };
-                ui.colored_label(color, text);
+                widgets::status_pill(ui, kind, text);
 
                 if let Some(ice) = self.conn_state.as_ref().and_then(|cs| cs.get_ice_info()) {
-                    ui.separator();
                     if ice.relay {
-                        ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "Relayed (TURN)");
+                        widgets::status_pill(ui, StatusKind::Neutral, "Relayed (TURN)");
                     } else {
-                        ui.colored_label(
-                            egui::Color32::GREEN,
+                        widgets::status_pill(
+                            ui,
+                            StatusKind::Positive,
                             format!("Direct ({})", ice.local_type),
                         );
                     }
                 }
             });
+            ui.add_space(theme::space::XS);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -542,17 +658,19 @@ impl App {
 
     fn show_error(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                self.show_logo(ui);
-                ui.add_space(30.0);
-                ui.colored_label(egui::Color32::RED, "Error");
-                ui.add_space(10.0);
-                ui.label(&self.error_message);
-                ui.add_space(20.0);
-                if ui.button("Try again").clicked() {
-                    self.cancel_session();
-                }
+            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+                self.show_logo_header(ui);
+                ui.vertical_centered(|ui| {
+                    widgets::status_pill(ui, StatusKind::Negative, "Error");
+                    ui.add_space(theme::space::SM);
+                    ui.label(&self.error_message);
+                });
+                ui.add_space(theme::space::XL);
+                ui.vertical_centered(|ui| {
+                    if widgets::primary_button(ui, true, "Try again").clicked() {
+                        self.cancel_session();
+                    }
+                });
             });
         });
     }
@@ -579,6 +697,12 @@ impl eframe::App for App {
         }
 
         match self.phase {
+            // The picker's thumbnail grid refreshes on its own timer even
+            // with no input, so it needs a repaint nudge; ChooseIntent and
+            // Error are fully static and don't.
+            Phase::Setup if self.setup_step == SetupStep::PickTarget => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
             Phase::Setup | Phase::Error => {}
             Phase::Viewing => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
