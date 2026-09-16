@@ -1,7 +1,17 @@
 pub mod picker;
+pub mod thumbnail;
 pub mod wgc;
 
 use std::time::Instant;
+
+/// What a capture session grabs: a single window, or an entire monitor.
+/// `Window` is the common case; `Monitor` backs the setup screen's "entire
+/// screen" tiles.
+#[derive(Clone, Copy)]
+pub enum CaptureTarget {
+    Window(windows_capture::window::Window),
+    Monitor(windows_capture::monitor::Monitor),
+}
 
 #[derive(Clone)]
 pub struct Frame {

@@ -1,9 +1,17 @@
 use anyhow::Result;
+use windows_capture::monitor::Monitor;
 use windows_capture::window::Window;
 
 pub struct WindowInfo {
     pub title: String,
     pub window: Window,
+}
+
+pub struct MonitorInfo {
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub monitor: Monitor,
 }
 
 pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
@@ -19,6 +27,33 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         result.push(WindowInfo { title, window: w });
     }
     Ok(result)
+}
+
+/// One tile per active display, labelled "Entire screen" when there's only
+/// one so the common case doesn't force the user to think about which
+/// monitor they mean.
+pub fn enumerate_monitors() -> Vec<MonitorInfo> {
+    let Ok(monitors) = Monitor::enumerate() else {
+        return Vec::new();
+    };
+    let multiple = monitors.len() > 1;
+    monitors
+        .into_iter()
+        .enumerate()
+        .map(|(i, monitor)| {
+            let label = if multiple {
+                format!("Monitor {}", i + 1)
+            } else {
+                "Entire screen".to_string()
+            };
+            MonitorInfo {
+                label,
+                width: monitor.width().unwrap_or(0),
+                height: monitor.height().unwrap_or(0),
+                monitor,
+            }
+        })
+        .collect()
 }
 
 /// Find the first window whose process name contains the given substring (case-insensitive).

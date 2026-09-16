@@ -101,6 +101,44 @@ pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::In
         .show(ui, add_contents)
 }
 
+/// A large clickable card for a top-level choice (e.g. "Start a session" vs.
+/// "Join a session"). Unlike [`primary_button`]/[`secondary_button`], both
+/// options here carry equal visual weight — this is a fork in the journey,
+/// not a primary/secondary action pair.
+pub fn choice_card(ui: &mut Ui, title: &str, description: &str) -> Response {
+    let p = theme::palette_for(ui);
+    let resp = egui::Frame::NONE
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.hairline))
+        .corner_radius(10)
+        .inner_margin(theme::space::LG)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .size(theme::size::LG)
+                        .family(FontFamily::Name(theme::SEMIBOLD.into())),
+                );
+                ui.add_space(theme::space::XS);
+                ui.colored_label(p.ink_2, description);
+            });
+        })
+        .response;
+
+    let resp = resp.interact(egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_stroke(
+            resp.rect,
+            10.0,
+            Stroke::new(1.5, p.accent),
+            egui::StrokeKind::Inside,
+        );
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 /// A small uppercase label used to introduce a section (e.g. "Window:" ->
 /// "SELECT A WINDOW").
 pub fn section_header(ui: &mut Ui, text: impl Into<String>) -> Response {

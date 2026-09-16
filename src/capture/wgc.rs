@@ -1,4 +1,4 @@
-use super::Frame;
+use super::{CaptureTarget, Frame};
 use anyhow::Result;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
@@ -10,7 +10,6 @@ use windows_capture::{
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     },
-    window::Window,
 };
 
 struct CaptureHandler {
@@ -59,24 +58,42 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
 }
 
 pub fn start_capture(
-    window: Window,
+    target: CaptureTarget,
     frame_tx: SyncSender<Frame>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let handle = std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let settings = Settings::new(
-                window,
-                CursorCaptureSettings::WithCursor,
-                DrawBorderSettings::WithoutBorder,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                frame_tx,
-            );
+            let result = match target {
+                CaptureTarget::Window(window) => {
+                    let settings = Settings::new(
+                        window,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::WithoutBorder,
+                        SecondaryWindowSettings::Default,
+                        MinimumUpdateIntervalSettings::Default,
+                        DirtyRegionSettings::Default,
+                        ColorFormat::Bgra8,
+                        frame_tx,
+                    );
+                    CaptureHandler::start(settings)
+                }
+                CaptureTarget::Monitor(monitor) => {
+                    let settings = Settings::new(
+                        monitor,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::WithoutBorder,
+                        SecondaryWindowSettings::Default,
+                        MinimumUpdateIntervalSettings::Default,
+                        DirtyRegionSettings::Default,
+                        ColorFormat::Bgra8,
+                        frame_tx,
+                    );
+                    CaptureHandler::start(settings)
+                }
+            };
 
-            if let Err(e) = CaptureHandler::start(settings) {
+            if let Err(e) = result {
                 tracing::error!("Capture error: {e}");
             }
         })?;
