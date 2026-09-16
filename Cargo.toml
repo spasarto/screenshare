@@ -33,6 +33,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 aes-gcm = "0.11"
 sha2 = "0.11"
 rand = "0.10"
+qrcode = { version = "0.14.1", default-features = false }
 
 [profile.release]
 opt-level = 3

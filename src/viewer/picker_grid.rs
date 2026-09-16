@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TILE_WIDTH: f32 = 156.0;
 const ART_HEIGHT: f32 = 72.0;
+/// Art size for the smaller [`PickerGrid::show_selected_preview`] card.
+const PREVIEW_WIDTH: f32 = 72.0;
+const PREVIEW_HEIGHT: f32 = 44.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Selection {
@@ -64,13 +67,6 @@ impl PickerGrid {
         grid
     }
 
-    /// Reserved for later phases (e.g. a "you're about to share X" preview
-    /// on the waiting screen).
-    #[allow(dead_code)]
-    pub fn selection(&self) -> Option<Selection> {
-        self.selection
-    }
-
     pub fn has_targets(&self) -> bool {
         !self.windows.is_empty() || !self.monitors.is_empty()
     }
@@ -88,9 +84,8 @@ impl PickerGrid {
         }
     }
 
-    /// Reserved for later phases (e.g. naming what's about to be shared on
-    /// the waiting screen).
-    #[allow(dead_code)]
+    /// The title of the selected window (or the label of the selected
+    /// monitor), for naming what's about to be shared.
     pub fn selected_label(&self) -> Option<String> {
         match self.selection? {
             Selection::Window(i) => self.windows.get(i).map(|w| w.title.clone()),
@@ -138,6 +133,23 @@ impl PickerGrid {
         }
 
         self.last_refresh = Some(Instant::now());
+    }
+
+    /// Point the selection at a specific window, re-enumerating once if it
+    /// isn't in the list yet. The `--process` auto-start finds its own
+    /// target without going through the grid, and the "you're sharing X"
+    /// preview would otherwise name whichever tile happened to be selected
+    /// by default. Clears the selection (so the preview shows nothing rather
+    /// than something false) if the window can't be found at all.
+    pub fn select_window(&mut self, window: &windows_capture::window::Window) {
+        if !self.windows.iter().any(|w| w.window == *window) {
+            self.refresh_window_list();
+        }
+        self.selection = self
+            .windows
+            .iter()
+            .position(|w| w.window == *window)
+            .map(Selection::Window);
     }
 
     /// Re-enumerate windows without touching any textures. Cheap enough to
@@ -410,6 +422,100 @@ impl PickerGrid {
             self.selection = Some(Selection::Window(idx));
         }
     }
+
+    /// A compact "this is what you're sharing" card for the progress
+    /// screens: the selected window's still (or its icon, or the monitor
+    /// glyph) next to its title, plus a Change control. Returns true when
+    /// Change was clicked.
+    ///
+    /// Keeps asking for art on the same throttle the grid uses, rather than
+    /// only drawing what the grid happened to capture: the `--process`
+    /// auto-start never shows the grid at all, and an empty box is a worse
+    /// answer to "what am I sharing?" than a stale one.
+    pub fn show_selected_preview(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        self.pump(ui.ctx());
+        self.request_preview_art(selection);
+
+        let p = theme::palette_for(ui);
+        let label = self.selected_label().unwrap_or_default();
+        let mut change = false;
+
+        egui::Frame::NONE
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.hairline))
+            .corner_radius(8)
+            .inner_margin(theme::space::SM)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, 4.0, p.surface_2);
+                    match selection {
+                        Selection::Monitor(_) => draw_monitor_glyph(ui, rect, p.ink_3),
+                        Selection::Window(i) => {
+                            let art = self
+                                .windows
+                                .get(i)
+                                .and_then(|w| self.window_art.get(&window_key(w)));
+                            if let Some(tex) = art.and_then(|a| a.thumb.as_ref()) {
+                                paint_fit(ui, rect, tex);
+                            } else if let Some(tex) = art.and_then(|a| a.icon.as_ref()) {
+                                paint_centered_icon(ui, rect, tex);
+                            }
+                        }
+                    }
+
+                    ui.add_space(theme::space::SM);
+                    // Change is laid out first, from the right: the title
+                    // truncates to whatever is left, instead of claiming the
+                    // full width and having the button drawn over it.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        change = widgets::secondary_button(ui, "Change")
+                            .on_hover_text("Ends this session and returns to the picker")
+                            .clicked();
+                        ui.add_space(theme::space::SM);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            widgets::section_header(ui, "You're sharing");
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&label).strong()).truncate(),
+                            )
+                            // Window titles are long and the card is narrow;
+                            // the truncated half is often the half that
+                            // identifies it.
+                            .on_hover_text(&label);
+                        });
+                    });
+                });
+            });
+
+        change
+    }
+
+    /// Ask for a still of the one window the preview is showing, on the same
+    /// interval the grid refreshes at. A no-op for a monitor selection,
+    /// which draws a glyph rather than a capture.
+    fn request_preview_art(&mut self, selection: Selection) {
+        let Selection::Window(idx) = selection else {
+            return;
+        };
+        let due = !self.thumbs.is_busy()
+            && self
+                .last_refresh
+                .is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
+        if !due {
+            return;
+        }
+        // Reuse the grid's timer so returning to the picker doesn't
+        // immediately fire a second batch for the tiles as well.
+        self.last_refresh = Some(Instant::now());
+        self.request_captures(&[idx]);
+    }
 }
 
 /// Identity for the art cache. The raw `HWND` as a `usize` — the same key
@@ -467,7 +573,7 @@ fn paint_fit(ui: &mut egui::Ui, rect: Rect, tex: &TextureHandle) {
 }
 
 fn paint_centered_icon(ui: &mut egui::Ui, rect: Rect, tex: &TextureHandle) {
-    let size = Vec2::splat((ART_HEIGHT * 0.45).min(tex.size_vec2().x));
+    let size = Vec2::splat((rect.height() * 0.45).min(tex.size_vec2().x));
     let draw_rect = Rect::from_center_size(rect.center(), size);
     ui.painter().image(
         tex.id(),

@@ -3,14 +3,15 @@ mod theme;
 mod widgets;
 
 use crate::CliArgs;
-use crate::app::SessionEvent;
+use crate::app::{SessionEvent, Stage};
 use crate::capture::picker;
 use crate::transport::{ConnState, SharedConnState};
 use egui::TextureHandle;
 use picker_grid::PickerGrid;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use widgets::StatusKind;
+use widgets::{QrCache, StatusKind, StepState};
 
 /// Fixed width of the centred column every screen lays its content out in,
 /// so the logo, fields and buttons all share one axis.
@@ -21,6 +22,14 @@ const COLUMN_WIDTH: f32 = 420.0;
 const WIDE_COLUMN_WIDTH: f32 = 640.0;
 
 const SERVER_URL: &str = "https://screenshare.aghj.dev";
+
+/// How long a "Copied" confirmation stays up after a copy.
+const COPIED_FOR: Duration = Duration::from_secs(2);
+
+/// Side length of the QR code on the waiting screen. Big enough that a phone
+/// held in front of the monitor resolves the modules; small enough to sit
+/// beside the link and the share preview without pushing Cancel off screen.
+const QR_SIZE: f32 = 112.0;
 
 pub struct DecodedFrame {
     pub width: u32,
@@ -41,6 +50,14 @@ enum SetupStep {
     ChooseIntent,
     /// Pick what to share (and, when joining, enter the peer's code).
     PickTarget,
+}
+
+/// Which of the two copyable things on the waiting screen was last copied,
+/// so the confirmation appears next to the button that was actually pressed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Copied {
+    Code,
+    Link,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -79,6 +96,13 @@ pub struct App {
 
     // Background communication
     event_rx: Option<std::sync::mpsc::Receiver<SessionEvent>>,
+    /// How far the in-flight session has got through the handshake. Drives
+    /// the step list on the three "please wait" screens.
+    stage: Stage,
+
+    // Handoff (WaitingForPeer)
+    qr: QrCache,
+    copied: Option<(Copied, Instant)>,
 
     // Viewing
     frame_buffer: Option<Arc<Mutex<Option<DecodedFrame>>>>,
@@ -163,6 +187,9 @@ impl App {
             cli_pin: if args.server { args.pin } else { None },
             last_process_poll: None,
             event_rx: None,
+            stage: Stage::ContactingServer,
+            qr: QrCache::default(),
+            copied: None,
             frame_buffer: None,
             texture: None,
             conn_state: None,
@@ -179,24 +206,9 @@ impl App {
         format!("{}{}", self.code_digits, self.code_letters)
     }
 
-    /// Keeps the two code-entry fields honest as the user types or pastes:
-    /// strips anything that isn't alphanumeric, forces lowercase, and
-    /// re-splits into a digit run followed by a letter run so pasting the
-    /// full code into either box (or typing a stray character into the
-    /// wrong one) still lands in the right place.
+    /// Runs [`normalize_code`] over the two code-entry fields, every frame.
     fn normalize_code_fields(&mut self) {
-        let raw: String = format!("{}{}", self.code_digits, self.code_letters)
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-        let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).take(6).collect();
-        let letters: String = raw
-            .chars()
-            .skip(digits.len())
-            .filter(|c| c.is_ascii_alphabetic())
-            .take(4)
-            .collect();
+        let (digits, letters) = normalize_code(&self.code_digits, &self.code_letters);
         self.code_digits = digits;
         self.code_letters = letters;
     }
@@ -234,6 +246,8 @@ impl App {
             std::thread::spawn(move || server.delete_session_blocking(&code));
         }
         self.event_rx = None;
+        self.stage = Stage::ContactingServer;
+        self.copied = None;
         self.frame_buffer = None;
         self.texture = None;
         self.conn_state = None;
@@ -247,6 +261,9 @@ impl App {
 
         while let Ok(event) = rx.try_recv() {
             match event {
+                SessionEvent::Progress(stage) => {
+                    self.stage = stage;
+                }
                 SessionEvent::SessionCode(code) => {
                     self.hosted_session_code = Some(code.clone());
                     self.session_code = code;
@@ -423,6 +440,7 @@ impl App {
                     event_tx,
                     cancel_rx,
                 );
+                self.stage = Stage::ContactingServer;
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
@@ -437,6 +455,7 @@ impl App {
                 self.session_cancel = Some(cancel_tx);
 
                 crate::app::spawn_answerer(SERVER_URL.to_string(), target, code, event_tx, cancel_rx);
+                self.stage = Stage::ContactingServer;
                 self.phase = Phase::Joining;
             }
         }
@@ -444,6 +463,9 @@ impl App {
 
     /// Auto-start a session directly with a found window (used by WaitingForProcess phase).
     fn start_with_window(&mut self, window: windows_capture::window::Window) {
+        // Keep the picker's selection in step, so the progress screens' share
+        // preview names the window actually being captured.
+        self.picker.select_window(&window);
         let target = crate::capture::CaptureTarget::Window(window);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         self.event_rx = Some(event_rx);
@@ -459,11 +481,13 @@ impl App {
                     event_tx,
                     cancel_rx,
                 );
+                self.stage = Stage::ContactingServer;
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
                 let code = self.join_code();
                 crate::app::spawn_answerer(SERVER_URL.to_string(), target, code, event_tx, cancel_rx);
+                self.stage = Stage::ContactingServer;
                 self.phase = Phase::Joining;
             }
         }
@@ -473,19 +497,74 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| {
             widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
                 self.show_logo_header(ui);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.add_space(theme::space::SM);
-                    ui.label("Creating session...");
-                });
-                ui.add_space(theme::space::XL);
-                ui.vertical_centered(|ui| {
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        self.cancel_session();
-                    }
-                });
+                ui.heading("Creating session");
+                ui.add_space(theme::space::MD);
+                widgets::progress_steps(ui, &self.progress_list());
+                ui.add_space(theme::space::LG);
+                self.show_share_preview(ui);
+                ui.add_space(theme::space::LG);
+                if widgets::secondary_button(ui, "Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
         });
+    }
+
+    /// The step list for the current role and stage, with everything before
+    /// the stage in flight marked done.
+    fn progress_list(&self) -> [(&'static str, StepState); 4] {
+        let labels = match self.role {
+            Role::Create => [
+                "Contacting the signaling server",
+                "Waiting for your peer to join",
+                "Negotiating the connection",
+                "Connected",
+            ],
+            Role::Join => [
+                "Looking up the session",
+                "Waiting for the host",
+                "Negotiating the connection",
+                "Connected",
+            ],
+        };
+        let current = match self.stage {
+            Stage::ContactingServer => 0,
+            Stage::WaitingForPeer => 1,
+            Stage::Negotiating => 2,
+            Stage::Connected => 3,
+        };
+        std::array::from_fn(|i| {
+            let state = match i.cmp(&current) {
+                std::cmp::Ordering::Less => StepState::Done,
+                std::cmp::Ordering::Equal => StepState::Current,
+                std::cmp::Ordering::Greater => StepState::Pending,
+            };
+            (labels[i], state)
+        })
+    }
+
+    /// "You're sharing X", on every screen between pressing Start and seeing
+    /// the remote screen — this app transmits from both ends, and nothing
+    /// used to say so.
+    fn show_share_preview(&mut self, ui: &mut egui::Ui) {
+        if self.picker.show_selected_preview(ui) {
+            // The capture target is baked into the session thread when it
+            // spawns, so picking a different one means starting over — which
+            // is exactly what cancelling does.
+            self.cancel_session();
+        }
+    }
+
+    /// True while the "Copied" confirmation for `what` should still be up.
+    fn copied_recently(&self, what: Copied) -> bool {
+        self.copied
+            .is_some_and(|(which, at)| which == what && at.elapsed() < COPIED_FOR)
+    }
+
+    /// The web link carrying the session code, so the peer can be handed a
+    /// URL instead of ten characters to type.
+    fn share_link(&self) -> String {
+        format!("{SERVER_URL}/j/{}", self.session_code)
     }
 
     fn show_waiting_for_process(&mut self, ui: &mut egui::Ui) {
@@ -524,36 +603,90 @@ impl App {
         });
     }
 
+    /// The handoff screen: everything needed to get the session to someone
+    /// else — the code, a link, a QR of that link — plus where the handshake
+    /// has got to and what is about to be shared.
     fn show_waiting_for_peer(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
+            widgets::centered_column(ui, WIDE_COLUMN_WIDTH, |ui| {
                 self.show_logo_header(ui);
-                ui.vertical_centered(|ui| {
-                    ui.heading("Session Created");
-                    ui.add_space(theme::space::LG);
+                self.show_session_code(ui);
+                ui.add_space(theme::space::SM);
 
-                    ui.label("Share this code with your peer:");
+                ui.columns(2, |columns| {
+                    // Left: the other way to hand the session over, then
+                    // where the handshake has got to.
+                    self.show_share_link(&mut columns[0]);
+                    columns[0].add_space(theme::space::LG);
+                    widgets::progress_steps(&mut columns[0], &self.progress_list());
+
+                    // Right: the same link as a QR for a phone, and what is
+                    // going out once the peer arrives.
+                    let ui = &mut columns[1];
+                    let link = self.share_link();
+                    self.qr.show(ui, &link, QR_SIZE);
+                    let p = theme::palette_for(ui);
+                    ui.colored_label(p.ink_3, "Scan to open the link");
                     ui.add_space(theme::space::MD);
-
-                    ui.label(
-                        egui::RichText::new(&self.session_code)
-                            .size(theme::size::HERO)
-                            .monospace()
-                            .strong(),
-                    );
-
-                    ui.add_space(theme::space::LG);
-                    ui.spinner();
-                    ui.add_space(theme::space::SM);
-                    ui.label("Waiting for peer to join...");
+                    self.show_share_preview(ui);
                 });
-                ui.add_space(theme::space::XL);
-                ui.vertical_centered(|ui| {
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        self.cancel_session();
-                    }
-                });
+
+                ui.add_space(theme::space::MD);
+                if widgets::secondary_button(ui, "Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
+        });
+    }
+
+    /// The code itself, grouped so it survives being read across a desk,
+    /// with the one-click copy the old screen left the user to do by hand.
+    fn show_session_code(&mut self, ui: &mut egui::Ui) {
+        widgets::section_header(ui, "Share this code with your peer");
+        ui.add_space(theme::space::XS);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(grouped_code(&self.session_code))
+                    .size(theme::size::HERO)
+                    .monospace()
+                    .strong(),
+            );
+            ui.add_space(theme::space::MD);
+            ui.vertical(|ui| {
+                // Sit the button against the code's middle rather than its
+                // cap height.
+                ui.add_space(theme::space::MD);
+                if widgets::secondary_button(ui, "Copy code").clicked() {
+                    // The separator is a reading aid, not part of the code.
+                    ui.ctx().copy_text(self.session_code.clone());
+                    self.copied = Some((Copied::Code, Instant::now()));
+                }
+                if self.copied_recently(Copied::Code) {
+                    let p = theme::palette_for(ui);
+                    ui.colored_label(p.connected, "Copied");
+                }
+            });
+        });
+    }
+
+    fn show_share_link(&mut self, ui: &mut egui::Ui) {
+        let link = self.share_link();
+        let p = theme::palette_for(ui);
+
+        widgets::section_header(ui, "Or send a link");
+        ui.add_space(theme::space::XS);
+        ui.add(
+            egui::Label::new(egui::RichText::new(display_link(&link)).color(p.ink_2)).truncate(),
+        );
+        ui.add_space(theme::space::XS);
+        ui.horizontal(|ui| {
+            if widgets::secondary_button(ui, "Copy link").clicked() {
+                ui.ctx().copy_text(link.clone());
+                self.copied = Some((Copied::Link, Instant::now()));
+            }
+            if self.copied_recently(Copied::Link) {
+                ui.colored_label(p.connected, "Copied");
+            }
         });
     }
 
@@ -561,17 +694,15 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| {
             widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
                 self.show_logo_header(ui);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.add_space(theme::space::SM);
-                    ui.label("Joining session...");
-                });
-                ui.add_space(theme::space::XL);
-                ui.vertical_centered(|ui| {
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        self.cancel_session();
-                    }
-                });
+                ui.heading(format!("Joining {}", grouped_code(&self.join_code())));
+                ui.add_space(theme::space::MD);
+                widgets::progress_steps(ui, &self.progress_list());
+                ui.add_space(theme::space::LG);
+                self.show_share_preview(ui);
+                ui.add_space(theme::space::LG);
+                if widgets::secondary_button(ui, "Cancel").clicked() {
+                    self.cancel_session();
+                }
             });
         });
     }
@@ -676,6 +807,70 @@ impl App {
     }
 }
 
+/// Keeps the two code-entry fields honest as the user types or pastes:
+/// strips anything that isn't alphanumeric, forces lowercase, and re-splits
+/// into a digit run followed by a letter run, so pasting the whole code into
+/// either box (or typing a stray character into the wrong one) still lands
+/// in the right place.
+///
+/// A paste that *contains* a code — the share link the host sends, most
+/// obviously — is reduced to just that code, so the peer can paste the link
+/// they were given and never type a character.
+fn normalize_code(digits: &str, letters: &str) -> (String, String) {
+    let raw: String = format!("{digits}{letters}")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+
+    if let Some(code) = extract_code(&raw) {
+        return (code[..6].to_string(), code[6..].to_string());
+    }
+
+    let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).take(6).collect();
+    let letters: String = raw
+        .chars()
+        .skip(digits.len())
+        .filter(|c| c.is_ascii_alphabetic())
+        .take(4)
+        .collect();
+    (digits, letters)
+}
+
+/// `482917bcdq` -> `482917 \u{00B7} bcdq`. The digits and the letters are two
+/// different alphabets; grouping them is what makes the code readable across
+/// a desk and repeatable over a phone.
+fn grouped_code(code: &str) -> String {
+    if crate::is_valid_pin(code) {
+        format!("{} \u{00B7} {}", &code[..6], &code[6..])
+    } else {
+        code.to_string()
+    }
+}
+
+/// The share link without its scheme — the part worth reading.
+fn display_link(link: &str) -> String {
+    link.strip_prefix("https://")
+        .or_else(|| link.strip_prefix("http://"))
+        .unwrap_or(link)
+        .to_string()
+}
+
+/// Finds a whole session code (6 digits then 4 letters) inside an already
+/// lowercased, alphanumeric-only string — which is what a pasted share link
+/// reduces to. Returns `None` for a partially typed code, leaving the
+/// digits-then-letters split below to handle it.
+fn extract_code(alnum: &str) -> Option<String> {
+    let chars: Vec<char> = alnum.chars().collect();
+    let last_start = chars.len().checked_sub(10)?;
+    (0..=last_start)
+        .find(|&i| {
+            chars[i..i + 6].iter().all(char::is_ascii_digit)
+                && chars[i + 6..i + 10].iter().all(char::is_ascii_alphabetic)
+        })
+        .map(|i| chars[i..i + 10].iter().collect())
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_events();
@@ -718,5 +913,75 @@ impl eframe::App for App {
             let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
             server.delete_session_blocking(code);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normalized(pasted: &str) -> (String, String) {
+        // As if the whole thing landed in the digits field.
+        normalize_code(pasted, "")
+    }
+
+    #[test]
+    fn pasting_a_share_link_fills_both_fields() {
+        assert_eq!(
+            normalized("https://screenshare.aghj.dev/j/482917bcdq"),
+            ("482917".to_string(), "bcdq".to_string())
+        );
+    }
+
+    #[test]
+    fn pasting_a_bare_code_fills_both_fields() {
+        assert_eq!(
+            normalized("482917bcdq"),
+            ("482917".to_string(), "bcdq".to_string())
+        );
+    }
+
+    #[test]
+    fn a_half_typed_code_still_splits_digits_then_letters() {
+        assert_eq!(
+            normalized("482917bc"),
+            ("482917".to_string(), "bc".to_string())
+        );
+    }
+
+    #[test]
+    fn a_stray_character_in_the_letters_field_moves_to_the_digits() {
+        assert_eq!(
+            normalize_code("48291", "7bcdq"),
+            ("482917".to_string(), "bcdq".to_string())
+        );
+    }
+
+    #[test]
+    fn extraction_finds_the_code_after_a_leading_digit() {
+        assert_eq!(
+            extract_code("1482917bcdq"),
+            Some("482917bcdq".to_string())
+        );
+    }
+
+    #[test]
+    fn extraction_gives_up_on_a_partial_code() {
+        assert_eq!(extract_code("482917bc"), None);
+    }
+
+    #[test]
+    fn grouping_leaves_anything_that_is_not_a_code_alone() {
+        assert_eq!(grouped_code("482917bcdq"), "482917 \u{00B7} bcdq");
+        assert_eq!(grouped_code("482917"), "482917");
+        assert_eq!(grouped_code(""), "");
+    }
+
+    #[test]
+    fn display_link_drops_the_scheme() {
+        assert_eq!(
+            display_link("https://screenshare.aghj.dev/j/482917bcdq"),
+            "screenshare.aghj.dev/j/482917bcdq"
+        );
     }
 }

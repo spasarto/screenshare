@@ -12,13 +12,18 @@ class_name = "Session"
 name = "RATE_LIMITER"
 class_name = "RateLimiter"
 
+# `new_sqlite_classes`, not `new_classes`: the free plan only offers the
+# SQLite-backed Durable Object storage backend, and creating a namespace the
+# old KV-backed way is rejected outright. The storage API both classes use
+# (get/put/setAlarm/deleteAll) is identical on either backend, so this is a
+# config change only.
 [[migrations]]
 tag = "v1"
-new_classes = ["Session"]
+new_sqlite_classes = ["Session"]
 
 [[migrations]]
 tag = "v2"
-new_classes = ["RateLimiter"]
+new_sqlite_classes = ["RateLimiter"]
 
 # Secrets (set via `wrangler secret put`):
 #   TURN_TOKEN_ID

@@ -186,3 +186,131 @@ pub fn status_pill(ui: &mut Ui, kind: StatusKind, text: impl Into<String>) -> Re
         })
         .response
 }
+
+/// Where one step of a multi-step progress list has got to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    Done,
+    Current,
+    Pending,
+}
+
+/// A vertical checklist of the steps a session goes through, with the
+/// current one spinning. Replaces the single unlabelled spinner that made
+/// "creating", "waiting" and "joining" look like the same screen: the point
+/// is to show how far along the handshake is, not just that it is busy.
+pub fn progress_steps(ui: &mut Ui, steps: &[(&str, StepState)]) {
+    let p = theme::palette_for(ui);
+    ui.scope(|ui| {
+        let spacing = ui.spacing_mut();
+        // One list, not four unrelated labels.
+        spacing.item_spacing.y = theme::space::XS;
+        // The rows are text, not controls. Without this they each inherit
+        // the 34px minimum height meant for clickable widgets, which is
+        // most of a second list's worth of empty space over four steps.
+        spacing.interact_size.y = 0.0;
+
+        for (label, state) in steps {
+            ui.horizontal(|ui| {
+                // Fixed-width gutter so the labels line up regardless of
+                // which marker (glyph or spinner) each row happens to draw.
+                ui.allocate_ui(Vec2::new(MARKER_WIDTH, MARKER_WIDTH), |ui| match state {
+                    StepState::Done => {
+                        ui.label(RichText::new("\u{2713}").color(p.connected)); // ✓
+                    }
+                    StepState::Current => {
+                        ui.add(egui::Spinner::new().size(theme::size::BODY));
+                    }
+                    StepState::Pending => {
+                        ui.label(
+                            RichText::new("\u{25CB}") // ○
+                                .size(theme::size::SM)
+                                .color(p.ink_3),
+                        );
+                    }
+                });
+                let text = RichText::new(*label);
+                ui.label(match state {
+                    StepState::Done => text.color(p.ink_2),
+                    StepState::Current => text
+                        .color(p.ink)
+                        .family(FontFamily::Name(theme::MEDIUM.into())),
+                    StepState::Pending => text.color(p.ink_3),
+                });
+            });
+        }
+    });
+}
+
+const MARKER_WIDTH: f32 = 18.0;
+
+/// A QR code, rasterised once per distinct payload and kept as a texture.
+///
+/// Held by the caller rather than rebuilt per frame: encoding is real work,
+/// and `load_texture` on every repaint would churn a GPU texture for pixels
+/// that only change when the session code does.
+#[derive(Default)]
+pub struct QrCache {
+    key: String,
+    texture: Option<egui::TextureHandle>,
+}
+
+impl QrCache {
+    /// Paints `data` as a QR code `size` px on a side (quiet zone included),
+    /// re-encoding only when `data` changes. A payload too long to encode
+    /// draws nothing rather than failing the frame.
+    pub fn show(&mut self, ui: &mut Ui, data: &str, size: f32) {
+        if self.key != data || self.texture.is_none() {
+            self.texture = qr_image(data).map(|img| {
+                ui.ctx()
+                    .load_texture("session-qr", img, egui::TextureOptions::NEAREST)
+            });
+            self.key = data.to_owned();
+        }
+
+        let Some(tex) = &self.texture else { return };
+        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+            tex.id(),
+            Vec2::splat(size),
+        )));
+    }
+}
+
+/// One image pixel per QR module would be scaled up by the GPU; this many
+/// keeps the edges crisp under `TextureOptions::NEAREST` at any display size.
+const QR_SCALE: usize = 4;
+/// The four-module quiet zone the QR spec requires around the symbol —
+/// without it, scanners struggle to find the finder patterns.
+const QR_QUIET: usize = 4;
+
+/// Renders `data` to a black-on-white QR bitmap.
+///
+/// Deliberately not theme-aware: scanners expect dark modules on a light
+/// ground, and inverting one for a dark UI is a coin flip on whether a phone
+/// camera reads it at all.
+fn qr_image(data: &str) -> Option<egui::ColorImage> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let modules = code.width();
+    let colors = code.to_colors();
+    let side = (modules + QR_QUIET * 2) * QR_SCALE;
+
+    let mut pixels = vec![egui::Color32::WHITE; side * side];
+    for y in 0..modules {
+        for x in 0..modules {
+            if colors[y * modules + x] != qrcode::Color::Dark {
+                continue;
+            }
+            let (px, py) = ((x + QR_QUIET) * QR_SCALE, (y + QR_QUIET) * QR_SCALE);
+            for row in py..py + QR_SCALE {
+                pixels[row * side + px..row * side + px + QR_SCALE]
+                    .fill(egui::Color32::BLACK);
+            }
+        }
+    }
+
+    Some(egui::ColorImage {
+        size: [side, side],
+        source_size: Vec2::new(side as f32, side as f32),
+        pixels,
+    })
+}

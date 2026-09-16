@@ -32,7 +32,9 @@ The binary is produced at `target/release/screenshare.exe`.
 screenshare
 ```
 
-Launch the app, choose **Create** or **Join**, select a window to share, and exchange the session code with the remote peer.
+Launch the app, choose **Start a session** or **Join a session**, and pick a window (or a whole display) to share.
+
+The host's waiting screen shows the session code, a share link and a QR of that link. The peer can paste the link straight into the code field — it's reduced to the code on the way in — or open it on a phone to read the code off the landing page.
 
 ### CLI flags
 
@@ -83,6 +85,8 @@ A Cloudflare Worker (`worker/`) handles initial session setup:
 1. **Create session** — generates a session code, provisions TURN credentials, and stores the (encrypted) SDP offer/answer in a Durable Object. A per-IP rate limit on the code-gated endpoints makes brute-forcing a code infeasible.
 2. **Join session** — the other peer polls for the offer, uploads its answer.
 3. After the WebRTC connection is established, all further signaling (ICE restarts) happens in-band over the data channel.
+
+It also serves `GET /j/:code`, the landing page behind the share link and QR. That page is static — it neither creates nor looks up the session, so opening a link costs nothing from the rate-limit budget and reveals nothing about whether the code exists.
 
 ### Key modules
 

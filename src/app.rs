@@ -20,7 +20,30 @@ pub enum Role {
     Answerer,
 }
 
+/// Where a session has got to in the signaling handshake. Reported to the
+/// GUI so the three "please wait" screens can name the step they're on
+/// instead of showing three identical spinners.
+///
+/// The variants are ordered, and the GUI relies on that ordering to mark
+/// everything before the current stage as done.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Stage {
+    /// Reaching the signaling server: creating the session (offerer) or
+    /// looking it up (answerer).
+    ContactingServer,
+    /// Session exists on the server; waiting on the other side to show up —
+    /// their answer (offerer) or their offer (answerer).
+    WaitingForPeer,
+    /// Both SDPs exchanged; ICE is finding a path and the data channel is
+    /// opening.
+    Negotiating,
+    /// Media threads running, frames about to flow.
+    Connected,
+}
+
 pub enum SessionEvent {
+    /// The handshake moved on to a new [`Stage`].
+    Progress(Stage),
     /// Offerer: session created, here's the code to share.
     SessionCode(String),
     SessionReady {
@@ -28,6 +51,13 @@ pub enum SessionEvent {
         conn_state: SharedConnState,
     },
     Error(String),
+}
+
+/// Report a stage transition, ignoring a closed channel: the GUI dropping the
+/// receiver means the session is being torn down, which the next real step
+/// will surface as `Cancelled` anyway.
+fn progress(event_tx: &std::sync::mpsc::Sender<SessionEvent>, stage: Stage) {
+    let _ = event_tx.send(SessionEvent::Progress(stage));
 }
 
 /// Spawn the offerer session in a background thread. `cancel_rx` lets the GUI
@@ -122,6 +152,8 @@ fn run_offerer(
     let (incoming_rx, signaling_tx) = _rt.block_on(async {
         let server = SignalingServer::new(&server_url);
 
+        progress(event_tx, Stage::ContactingServer);
+
         // Create session and get ICE servers from the signaling server
         let (code, ice_servers) = server.create_session(custom_pin).await?;
         // Derived from the code both peers share out of band; never sent to
@@ -138,6 +170,7 @@ fn run_offerer(
         event_tx
             .send(SessionEvent::SessionCode(code.clone()))
             .map_err(|_| anyhow::anyhow!("GUI disconnected"))?;
+        progress(event_tx, Stage::WaitingForPeer);
 
         // Poll for the answer from the remote peer. Answers that don't
         // decrypt under `key` (i.e. didn't come from someone holding the
@@ -145,6 +178,7 @@ fn run_offerer(
         // here (the "waiting for peer" screen) is the common case this
         // whole plumbing exists for.
         let answer_json = server.poll_answer(&code, &key, cancel_rx).await?;
+        progress(event_tx, Stage::Negotiating);
         peer.set_answer(&answer_json).await?;
 
         let dc_holder = peer.data_channel();
@@ -179,6 +213,7 @@ fn run_offerer(
         conn_state.clone(),
     )?;
 
+    progress(event_tx, Stage::Connected);
     event_tx
         .send(SessionEvent::SessionReady {
             frame_buffer,
@@ -219,14 +254,19 @@ fn run_answerer(
         // to the signaling server. See transport::crypto for why this matters.
         let key = crate::transport::crypto::SessionKey::derive(session_code);
 
+        progress(event_tx, Stage::ContactingServer);
+
         // Join the session, polling until it exists (handles client starting before server)
         let ice_servers = server
             .join_session_polling(session_code, cancel_rx.clone())
             .await?;
 
+        progress(event_tx, Stage::WaitingForPeer);
+
         // Poll for the offer from the remote peer. An offer that doesn't
         // decrypt under `key` (wrong code) is silently skipped inside poll_offer.
         let offer_json = server.poll_offer(session_code, &key, cancel_rx).await?;
+        progress(event_tx, Stage::Negotiating);
 
         let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
         let answer_json = peer.accept_offer(&offer_json).await?;
@@ -268,6 +308,7 @@ fn run_answerer(
         conn_state.clone(),
     )?;
 
+    progress(event_tx, Stage::Connected);
     event_tx
         .send(SessionEvent::SessionReady {
             frame_buffer,
