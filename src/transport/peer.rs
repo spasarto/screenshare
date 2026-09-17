@@ -1,6 +1,7 @@
 use crate::app::Role;
 use crate::transport::signaling::{self, SignalingBlob};
-use crate::transport::{ConnState, SharedConnState};
+use crate::transport::control::Control;
+use crate::transport::{ConnState, SessionStats, SharedConnState};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::stats::StatsReportType;
 
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const BACKOFF_BASE_MS: u64 = 1000;
 const BACKOFF_CAP_MS: u64 = 30000;
 
@@ -325,6 +326,7 @@ pub fn spawn_sender(
     dc_holder: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     conn_state: SharedConnState,
+    stats: Arc<SessionStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Wait for the data channel to become available before sending.
@@ -363,11 +365,16 @@ pub fn spawn_sender(
             }
 
             let chunks = super::framing::encode_chunked(&data);
+            let mut sent = true;
             for chunk in chunks {
                 if let Err(e) = dc.send(&bytes::Bytes::from(chunk)).await {
                     tracing::warn!("Failed to send on data channel: {e}");
+                    sent = false;
                     break;
                 }
+            }
+            if sent {
+                stats.add_sent(data.len());
             }
         }
     })
@@ -433,6 +440,34 @@ async fn send_raw(
     Ok(())
 }
 
+/// Send a session control message to the peer. Best effort by nature: a
+/// control message that can't be delivered (no channel yet, link down) has
+/// nothing useful to retry against.
+pub async fn send_control(
+    dc_holder: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    control: Control,
+) -> Result<()> {
+    send_raw(dc_holder, control.encode()).await
+}
+
+/// Waits (up to `timeout`) for everything queued on the data channel to be
+/// handed to the network. `send` only queues, so closing the peer connection
+/// straight after one otherwise discards the message.
+pub async fn flush(
+    dc_holder: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    timeout: Duration,
+) {
+    let Some(dc) = dc_holder.lock().await.clone() else {
+        return;
+    };
+    let _ = tokio::time::timeout(timeout, async {
+        while dc.buffered_amount().await > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
 /// Spawn the reconnection monitor task. This task waits for disconnection notifications
 /// and performs ICE restart negotiation over the existing data channel.
 pub fn spawn_reconnect_monitor(
@@ -449,6 +484,11 @@ pub fn spawn_reconnect_monitor(
         loop {
             // Wait for a disconnection signal
             disconnect_notify.notified().await;
+            // Closed on purpose (either side hung up): nothing to restart.
+            if conn_state.get() == ConnState::Failed {
+                tracing::info!("Reconnect monitor: connection closed, stopping");
+                break;
+            }
             tracing::info!("Reconnect monitor: disconnection detected, starting ICE restart");
 
             attempt += 1;
@@ -462,6 +502,7 @@ pub fn spawn_reconnect_monitor(
                 }
                 break;
             }
+            conn_state.set_reconnect_attempt(attempt);
 
             // Exponential backoff
             let delay = BACKOFF_BASE_MS * 2u64.pow(attempt - 1);

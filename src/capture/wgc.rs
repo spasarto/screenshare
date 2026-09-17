@@ -1,9 +1,11 @@
 use super::{CaptureTarget, Frame};
 use anyhow::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 use windows_capture::{
-    capture::{Context, GraphicsCaptureApiHandler},
+    capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
     frame,
     graphics_capture_api::InternalCaptureControl,
     settings::{
@@ -14,16 +16,23 @@ use windows_capture::{
 
 struct CaptureHandler {
     tx: SyncSender<Frame>,
+    paused: Arc<AtomicBool>,
     scratch: Vec<u8>,
 }
 
+struct Flags {
+    tx: SyncSender<Frame>,
+    paused: Arc<AtomicBool>,
+}
+
 impl GraphicsCaptureApiHandler for CaptureHandler {
-    type Flags = SyncSender<Frame>;
+    type Flags = Flags;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
-            tx: ctx.flags,
+            tx: ctx.flags.tx,
+            paused: ctx.flags.paused,
             scratch: Vec::new(),
         })
     }
@@ -33,6 +42,12 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         frame: &mut frame::Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        // Paused: drop the frame before paying for the GPU readback, so
+        // nothing reaches the encoder and it goes idle.
+        if self.paused.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let width = frame.width();
         let height = frame.height();
 
@@ -57,46 +72,54 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     }
 }
 
+/// A running capture. Dropping it without calling [`CaptureSession::stop`]
+/// leaves the capture thread running, which is what every session did
+/// before Disconnect existed — so the one owner is expected to stop it.
+pub struct CaptureSession {
+    control: CaptureControl<CaptureHandler, <CaptureHandler as GraphicsCaptureApiHandler>::Error>,
+}
+
+impl CaptureSession {
+    /// Stops capturing and waits for the capture thread to exit. The frame
+    /// sender drops with the handler, which in turn ends the encoder thread.
+    pub fn stop(self) {
+        if let Err(e) = self.control.stop() {
+            tracing::warn!("Failed to stop capture cleanly: {e}");
+        }
+    }
+}
+
+/// Starts capturing `target` on its own thread. While `paused` is set,
+/// frames are dropped at the source.
 pub fn start_capture(
     target: CaptureTarget,
     frame_tx: SyncSender<Frame>,
-) -> Result<std::thread::JoinHandle<()>> {
-    let handle = std::thread::Builder::new()
-        .name("capture".into())
-        .spawn(move || {
-            let result = match target {
-                CaptureTarget::Window(window) => {
-                    let settings = Settings::new(
-                        window,
-                        CursorCaptureSettings::WithCursor,
-                        DrawBorderSettings::WithoutBorder,
-                        SecondaryWindowSettings::Default,
-                        MinimumUpdateIntervalSettings::Default,
-                        DirtyRegionSettings::Default,
-                        ColorFormat::Bgra8,
-                        frame_tx,
-                    );
-                    CaptureHandler::start(settings)
-                }
-                CaptureTarget::Monitor(monitor) => {
-                    let settings = Settings::new(
-                        monitor,
-                        CursorCaptureSettings::WithCursor,
-                        DrawBorderSettings::WithoutBorder,
-                        SecondaryWindowSettings::Default,
-                        MinimumUpdateIntervalSettings::Default,
-                        DirtyRegionSettings::Default,
-                        ColorFormat::Bgra8,
-                        frame_tx,
-                    );
-                    CaptureHandler::start(settings)
-                }
-            };
+    paused: Arc<AtomicBool>,
+) -> Result<CaptureSession> {
+    let flags = Flags { tx: frame_tx, paused };
+    let control = match target {
+        CaptureTarget::Window(window) => CaptureHandler::start_free_threaded(Settings::new(
+            window,
+            CursorCaptureSettings::WithCursor,
+            DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            flags,
+        )),
+        CaptureTarget::Monitor(monitor) => CaptureHandler::start_free_threaded(Settings::new(
+            monitor,
+            CursorCaptureSettings::WithCursor,
+            DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            flags,
+        )),
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to start capture: {e}"))?;
 
-            if let Err(e) = result {
-                tracing::error!("Capture error: {e}");
-            }
-        })?;
-
-    Ok(handle)
+    Ok(CaptureSession { control })
 }

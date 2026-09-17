@@ -65,6 +65,43 @@ pub fn secondary_button(ui: &mut Ui, text: impl Into<String>) -> Response {
     .inner
 }
 
+/// A secondary-weight button that stays visibly "on" while `selected` —
+/// for view toggles like Fit / 1:1 and Stats, where the current state
+/// matters as much as the action.
+pub fn toggle_button(ui: &mut Ui, selected: bool, text: impl Into<String>) -> Response {
+    if !selected {
+        return secondary_button(ui, text);
+    }
+    let p = theme::palette_for(ui);
+    let text = text.into();
+    ui.scope(|ui| {
+        style_button(ui, p.accent_wash, p.accent_wash, p.ink, Stroke::new(1.0, p.accent));
+        ui.add(
+            egui::Button::new(text)
+                .corner_radius(6)
+                .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
+        )
+    })
+    .inner
+}
+
+/// An outline button in the failure colour, for the one action that ends
+/// something (e.g. "Disconnect"). Not filled: it should be findable, not the
+/// loudest thing on screen.
+pub fn danger_button(ui: &mut Ui, text: impl Into<String>) -> Response {
+    let p = theme::palette_for(ui);
+    let text = text.into();
+    ui.scope(|ui| {
+        style_button(ui, p.surface_2, p.failed_wash, p.failed, Stroke::new(1.0, p.failed));
+        ui.add(
+            egui::Button::new(RichText::new(text).family(FontFamily::Name(theme::MEDIUM.into())))
+                .corner_radius(6)
+                .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
+        )
+    })
+    .inner
+}
+
 /// Overrides the inactive/hovered/active widget visuals for the buttons
 /// added inside this `ui.scope`, so we get egui's normal hover/press
 /// feedback for free instead of a single flat fill (which `Button::fill`
@@ -88,9 +125,6 @@ fn style_button(ui: &mut Ui, fill: egui::Color32, hover_fill: egui::Color32, fg:
 }
 
 /// A card: a bordered, rounded surface used to visually group content.
-/// Not yet used by phase 1's screens — reserved for the settings/stats
-/// panels planned for later phases.
-#[allow(dead_code)]
 pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
     let p = theme::palette_for(ui);
     egui::Frame::NONE
@@ -168,8 +202,10 @@ pub fn status_pill(ui: &mut Ui, kind: StatusKind, text: impl Into<String>) -> Re
     let p = theme::palette_for(ui);
     let (fg, bg, glyph) = match kind {
         StatusKind::Positive => (p.connected, p.connected_wash, "\u{25CF}"), // ●
-        StatusKind::Warning => (p.reconnecting, p.reconnecting_wash, "\u{25D0}"), // ◐
-        StatusKind::Negative => (p.failed, p.failed_wash, "\u{2715}"),       // ✕
+        // Glyphs Inter itself has. ◐ and ✕ fell through to egui's fallback
+        // fonts and drew as empty boxes.
+        StatusKind::Warning => (p.reconnecting, p.reconnecting_wash, "\u{26A0}"), // ⚠
+        StatusKind::Negative => (p.failed, p.failed_wash, "\u{00D7}"),       // ×
         StatusKind::Neutral => (p.ink_3, p.surface_2, "\u{25CB}"),           // ○
     };
     egui::Frame::NONE

@@ -34,6 +34,9 @@ aes-gcm = "0.11"
 sha2 = "0.11"
 rand = "0.10"
 qrcode = { version = "0.14.1", default-features = false }
+# Both aws-lc-rs (via reqwest) and ring (via webrtc's DTLS) are compiled in, so
+# rustls can't pick a crypto provider on its own; main() installs ring.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [profile.release]
 opt-level = 3

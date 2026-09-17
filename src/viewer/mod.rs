@@ -1,14 +1,16 @@
 mod picker_grid;
+mod stats;
 mod theme;
 mod widgets;
 
 use crate::CliArgs;
-use crate::app::{SessionEvent, Stage};
-use crate::capture::picker;
-use crate::transport::{ConnState, SharedConnState};
-use egui::TextureHandle;
+use crate::app::{Repaint, SessionEvent, SessionHandle, Stage};
+use crate::capture::{CaptureTarget, picker};
+use crate::transport::ConnState;
+use crate::transport::peer::MAX_RECONNECT_ATTEMPTS;
+use egui::{Rect, TextureHandle, Vec2};
 use picker_grid::PickerGrid;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use widgets::{QrCache, StatusKind, StepState};
@@ -30,6 +32,28 @@ const COPIED_FOR: Duration = Duration::from_secs(2);
 /// held in front of the monitor resolves the modules; small enough to sit
 /// beside the link and the share preview without pushing Cancel off screen.
 const QR_SIZE: f32 = 112.0;
+
+/// In fullscreen, how long the pointer has to sit still before the toolbar
+/// and sharing bar get out of the way.
+const CHROME_IDLE_HIDE: Duration = Duration::from_millis(2500);
+
+/// How long "Waiting for your peer's screen" waits before offering reasons.
+const NO_FRAMES_HINT_AFTER: Duration = Duration::from_secs(15);
+
+/// Repaint cadence while viewing with nothing arriving: enough for the
+/// duration counter, stats and reconnect timer. Frames request their own
+/// repaints as they land.
+const VIEWING_TICK: Duration = Duration::from_millis(500);
+
+/// Size of the outgoing-frame still in the sharing bar.
+const SHARING_THUMB: Vec2 = Vec2::new(64.0, 36.0);
+
+/// Width of the cards laid over the remote screen (session ended, waiting).
+const OVERLAY_WIDTH: f32 = 360.0;
+
+/// Upper bound on how long closing the window waits for the peer to be told.
+/// Slightly over the session thread's own goodbye timeout.
+const EXIT_GOODBYE_WAIT: Duration = Duration::from_millis(600);
 
 pub struct DecodedFrame {
     pub width: u32,
@@ -58,6 +82,69 @@ enum SetupStep {
 enum Copied {
     Code,
     Link,
+}
+
+/// What a session is capturing, fixed when it starts. Kept apart from the
+/// picker, whose selection can move when its list refreshes — Reconnect has
+/// to share the same thing again, not whatever tile is selected by then.
+#[derive(Clone)]
+struct ActiveShare {
+    target: CaptureTarget,
+    label: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Zoom {
+    /// Scale the remote screen to fit the window.
+    Fit,
+    /// One remote pixel per physical screen pixel, scrolling if it's bigger.
+    Actual,
+}
+
+/// View state for the Viewing phase. Zoom and the stats toggle carry over
+/// between sessions; the rest restarts with each one.
+struct ViewerState {
+    zoom: Zoom,
+    show_stats: bool,
+    fullscreen: bool,
+    connected_at: Instant,
+    /// Last pointer or key input, for hiding the bars in fullscreen.
+    last_activity: Instant,
+    sampler: stats::Sampler,
+    outgoing_preview: Option<TextureHandle>,
+}
+
+impl ViewerState {
+    fn new() -> Self {
+        Self {
+            zoom: Zoom::Fit,
+            show_stats: false,
+            fullscreen: false,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+            sampler: stats::Sampler::default(),
+            outgoing_preview: None,
+        }
+    }
+
+    fn start_session(&mut self) {
+        self.connected_at = Instant::now();
+        self.last_activity = Instant::now();
+        self.sampler = stats::Sampler::default();
+        self.outgoing_preview = None;
+    }
+}
+
+/// Everything the viewing screen's controls can ask for, applied after the
+/// frame is drawn so the drawing code only ever needs to read `App`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerAction {
+    Disconnect,
+    Reconnect,
+    SetFullscreen(bool),
+    SetZoom(Zoom),
+    ToggleStats,
+    SetPaused(bool),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -104,10 +191,16 @@ pub struct App {
     qr: QrCache,
     copied: Option<(Copied, Instant)>,
 
+    /// What the in-flight or live session is capturing.
+    active_share: Option<ActiveShare>,
+
     // Viewing
-    frame_buffer: Option<Arc<Mutex<Option<DecodedFrame>>>>,
+    session: Option<SessionHandle>,
     texture: Option<TextureHandle>,
-    conn_state: Option<SharedConnState>,
+    viewer: ViewerState,
+
+    /// For waking the GUI from the decoder thread.
+    egui_ctx: egui::Context,
 
     // Logo
     logo_texture: Option<TextureHandle>,
@@ -115,8 +208,9 @@ pub struct App {
     // Cleanup: set when we are the offerer and have a session code
     hosted_session_code: Option<String>,
 
-    // Set while a background session thread is signaling (CreatingSession,
-    // WaitingForPeer, Joining). Sending `true` tells it to give up.
+    // Set while a background session thread is running (CreatingSession,
+    // WaitingForPeer, Joining, Viewing). Sending `true` tells it to give up,
+    // or hang up if already connected.
     session_cancel: Option<watch::Sender<bool>>,
 
     // Error
@@ -190,9 +284,11 @@ impl App {
             stage: Stage::ContactingServer,
             qr: QrCache::default(),
             copied: None,
-            frame_buffer: None,
+            active_share: None,
+            session: None,
             texture: None,
-            conn_state: None,
+            viewer: ViewerState::new(),
+            egui_ctx: cc.egui_ctx.clone(),
             logo_texture,
             hosted_session_code: None,
             session_cancel: None,
@@ -235,9 +331,21 @@ impl App {
         None
     }
 
-    /// Abandon whatever session is in flight (if any) and return to the
-    /// setup screen. Safe to call from any phase.
+    /// Abandon whatever session is in flight or live (if any) and return to
+    /// the setup screen. Safe to call from any phase.
     fn cancel_session(&mut self) {
+        self.end_session();
+        self.active_share = None;
+        self.set_fullscreen(false);
+        self.picker.refresh_list();
+        self.phase = Phase::Setup;
+        self.setup_step = SetupStep::PickTarget;
+    }
+
+    /// Tells the session thread to hang up (sending the peer a goodbye if
+    /// connected) and drops everything the GUI held for it. Leaves the phase
+    /// alone, so Reconnect can go straight into a new session.
+    fn end_session(&mut self) {
         if let Some(tx) = self.session_cancel.take() {
             let _ = tx.send(true);
         }
@@ -248,12 +356,37 @@ impl App {
         self.event_rx = None;
         self.stage = Stage::ContactingServer;
         self.copied = None;
-        self.frame_buffer = None;
+        self.session = None;
         self.texture = None;
-        self.conn_state = None;
-        self.picker.refresh_list();
-        self.phase = Phase::Setup;
-        self.setup_step = SetupStep::PickTarget;
+    }
+
+    /// Starts a new session the same way round as the one that just ended:
+    /// the host re-creates its code, the joiner looks it up again, so each
+    /// side pressing Reconnect meets the other without anyone retyping.
+    /// Falls back to the picker if the shared window has since closed.
+    fn reconnect(&mut self) {
+        let Some(share) = self.active_share.clone() else {
+            self.cancel_session();
+            return;
+        };
+        if let CaptureTarget::Window(window) = share.target
+            && !window.is_valid()
+        {
+            self.cancel_session();
+            return;
+        }
+        let code = self.session_code.clone();
+        self.end_session();
+        let create_pin = (self.role == Role::Create && crate::is_valid_pin(&code)).then_some(code);
+        self.spawn_session(share, create_pin);
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        if self.viewer.fullscreen != fullscreen {
+            self.viewer.fullscreen = fullscreen;
+            self.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+        }
     }
 
     fn process_events(&mut self) {
@@ -269,12 +402,13 @@ impl App {
                     self.session_code = code;
                     self.phase = Phase::WaitingForPeer;
                 }
-                SessionEvent::SessionReady {
-                    frame_buffer,
-                    conn_state,
-                } => {
-                    self.frame_buffer = Some(frame_buffer);
-                    self.conn_state = Some(conn_state);
+                SessionEvent::SessionReady(session) => {
+                    // The session thread deletes the server-side session
+                    // once connected; nothing left for us to clean up.
+                    self.hosted_session_code = None;
+                    self.session = Some(session);
+                    self.texture = None;
+                    self.viewer.start_session();
                     self.phase = Phase::Viewing;
                 }
                 SessionEvent::Error(msg) => {
@@ -425,69 +559,61 @@ impl App {
         let Some(target) = self.picker.selected_capture_target() else {
             return;
         };
-
-        match self.role {
-            Role::Create => {
-                let (event_tx, event_rx) = std::sync::mpsc::channel();
-                self.event_rx = Some(event_rx);
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                self.session_cancel = Some(cancel_tx);
-
-                crate::app::spawn_offerer(
-                    SERVER_URL.to_string(),
-                    target,
-                    self.cli_pin.clone(),
-                    event_tx,
-                    cancel_rx,
-                );
-                self.stage = Stage::ContactingServer;
-                self.phase = Phase::CreatingSession;
-            }
-            Role::Join => {
-                let code = self.join_code();
-                if !crate::is_valid_pin(&code) {
-                    return;
-                }
-
-                let (event_tx, event_rx) = std::sync::mpsc::channel();
-                self.event_rx = Some(event_rx);
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                self.session_cancel = Some(cancel_tx);
-
-                crate::app::spawn_answerer(SERVER_URL.to_string(), target, code, event_tx, cancel_rx);
-                self.stage = Stage::ContactingServer;
-                self.phase = Phase::Joining;
-            }
+        if self.role == Role::Join && !crate::is_valid_pin(&self.join_code()) {
+            return;
         }
+        let label = self.picker.selected_label().unwrap_or_default();
+        self.spawn_session(ActiveShare { target, label }, self.cli_pin.clone());
     }
 
     /// Auto-start a session directly with a found window (used by WaitingForProcess phase).
-    fn start_with_window(&mut self, window: windows_capture::window::Window) {
+    fn start_with_window(&mut self, info: picker::WindowInfo) {
         // Keep the picker's selection in step, so the progress screens' share
         // preview names the window actually being captured.
-        self.picker.select_window(&window);
-        let target = crate::capture::CaptureTarget::Window(window);
+        self.picker.select_window(&info.window);
+        let share = ActiveShare {
+            target: CaptureTarget::Window(info.window),
+            label: info.title,
+        };
+        self.spawn_session(share, self.cli_pin.clone());
+    }
+
+    /// Spawns the session thread for the current role. `create_pin` is the
+    /// code to host under (from `--pin`, or the previous session's code on
+    /// Reconnect); a joiner uses the code in the Join fields.
+    fn spawn_session(&mut self, share: ActiveShare, create_pin: Option<String>) {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         self.event_rx = Some(event_rx);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.session_cancel = Some(cancel_tx);
+        let ctx = self.egui_ctx.clone();
+        let repaint: Repaint = Arc::new(move || ctx.request_repaint());
+
+        let target = share.target;
+        self.active_share = Some(share);
+        self.stage = Stage::ContactingServer;
 
         match self.role {
             Role::Create => {
                 crate::app::spawn_offerer(
                     SERVER_URL.to_string(),
                     target,
-                    self.cli_pin.clone(),
+                    create_pin,
                     event_tx,
                     cancel_rx,
+                    repaint,
                 );
-                self.stage = Stage::ContactingServer;
                 self.phase = Phase::CreatingSession;
             }
             Role::Join => {
-                let code = self.join_code();
-                crate::app::spawn_answerer(SERVER_URL.to_string(), target, code, event_tx, cancel_rx);
-                self.stage = Stage::ContactingServer;
+                crate::app::spawn_answerer(
+                    SERVER_URL.to_string(),
+                    target,
+                    self.join_code(),
+                    event_tx,
+                    cancel_rx,
+                    repaint,
+                );
                 self.phase = Phase::Joining;
             }
         }
@@ -580,7 +706,7 @@ impl App {
             self.last_process_poll = Some(std::time::Instant::now());
             if let Some(info) = picker::find_window_by_process(&process_name) {
                 tracing::info!("Found process '{}': window '{}'", process_name, info.title);
-                self.start_with_window(info.window);
+                self.start_with_window(info);
                 return;
             }
         }
@@ -709,82 +835,430 @@ impl App {
 
     fn show_viewing(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
 
-        // Check for new frame
-        if let Some(fb) = &self.frame_buffer {
-            let new_frame = {
-                let mut guard = fb.lock().unwrap();
-                guard.take()
-            };
+        self.upload_frames(&ctx, &session);
+        self.track_viewer_input(&ctx);
 
-            if let Some(decoded) = new_frame {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [decoded.width as usize, decoded.height as usize],
-                    &decoded.rgba,
-                );
+        let conn = &session.conn_state;
+        let state = conn.get();
+        let paused = session.is_paused();
+        let fullscreen = self.viewer.fullscreen;
+        let has_frame = self.texture.is_some();
+        // Stops counting once the session has ended.
+        let duration = if state == ConnState::Failed {
+            conn.since().saturating_duration_since(self.viewer.connected_at)
+        } else {
+            self.viewer.connected_at.elapsed()
+        };
 
-                match &mut self.texture {
-                    Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                    None => {
-                        self.texture = Some(ctx.load_texture(
-                            "remote_screen",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
+        // In fullscreen the bars get out of the way once the pointer rests —
+        // but never while something needs the user's attention.
+        let idle_for = self.viewer.last_activity.elapsed();
+        let chrome_visible = !fullscreen
+            || idle_for < CHROME_IDLE_HIDE
+            || state != ConnState::Connected
+            || !has_frame;
+        if !chrome_visible {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        } else if fullscreen && idle_for < CHROME_IDLE_HIDE {
+            ctx.request_repaint_after(CHROME_IDLE_HIDE - idle_for);
+        }
+
+        let mut actions: Vec<ViewerAction> = Vec::new();
+        let p = theme::palette_for(ui);
+
+        if chrome_visible {
+            egui::Panel::top("viewer_toolbar").show(ui, |ui| {
+                ui.add_space(theme::space::XS);
+                ui.horizontal(|ui| {
+                    let (kind, text) = connection_status(conn);
+                    widgets::status_pill(ui, kind, text);
+                    if state == ConnState::Connected
+                        && let Some(ice) = conn.get_ice_info()
+                    {
+                        if ice.relay {
+                            widgets::status_pill(ui, StatusKind::Neutral, "Relayed (TURN)")
+                                .on_hover_text("Traffic goes through a relay server");
+                        } else {
+                            widgets::status_pill(ui, StatusKind::Positive, "Direct")
+                                .on_hover_text(format!("Peer-to-peer ({})", ice.local_type));
+                        }
                     }
+                    ui.colored_label(
+                        p.ink_3,
+                        stats::format_duration(duration),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::danger_button(ui, "Disconnect")
+                            .on_hover_text("End the session for both of you")
+                            .clicked()
+                        {
+                            actions.push(ViewerAction::Disconnect);
+                        }
+                        let (label, hint) = if fullscreen {
+                            ("Exit fullscreen", "F11 or Esc")
+                        } else {
+                            ("Fullscreen", "F11")
+                        };
+                        if widgets::secondary_button(ui, label).on_hover_text(hint).clicked() {
+                            actions.push(ViewerAction::SetFullscreen(!fullscreen));
+                        }
+                        if widgets::toggle_button(ui, self.viewer.show_stats, "Stats").clicked() {
+                            actions.push(ViewerAction::ToggleStats);
+                        }
+                        ui.add_space(theme::space::SM);
+                        // Right-to-left, so "1:1" first reads as "Fit  1:1".
+                        let zoom = self.viewer.zoom;
+                        if widgets::toggle_button(ui, zoom == Zoom::Actual, "1:1")
+                            .on_hover_text("Actual size: one remote pixel per screen pixel")
+                            .clicked()
+                        {
+                            actions.push(ViewerAction::SetZoom(Zoom::Actual));
+                        }
+                        if widgets::toggle_button(ui, zoom == Zoom::Fit, "Fit")
+                            .on_hover_text("Scale to fit the window")
+                            .clicked()
+                        {
+                            actions.push(ViewerAction::SetZoom(Zoom::Fit));
+                        }
+                    });
+                });
+                ui.add_space(theme::space::XS);
+            });
+
+            egui::Panel::bottom("sharing_bar").show(ui, |ui| {
+                ui.add_space(theme::space::XS);
+                self.show_sharing_bar(ui, state, paused, &mut actions);
+                ui.add_space(theme::space::XS);
+            });
+        } else {
+            // The bars are hidden, but what's going out never is.
+            let label = self.sharing_label();
+            egui::Area::new(egui::Id::new("sharing_reminder"))
+                .anchor(
+                    egui::Align2::LEFT_BOTTOM,
+                    egui::vec2(theme::space::MD, -theme::space::MD),
+                )
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    if paused {
+                        widgets::status_pill(ui, StatusKind::Warning, "Sharing paused");
+                    } else {
+                        widgets::status_pill(ui, StatusKind::Positive, format!("Sharing {label}"));
+                    }
+                });
+        }
+
+        if self.viewer.show_stats {
+            let rates = self.viewer.sampler.update(&session.stats);
+            egui::Panel::right("stats_panel")
+                .resizable(false)
+                .exact_size(stats::PANEL_WIDTH)
+                .show(ui, |ui| {
+                    ui.add_space(theme::space::LG);
+                    stats::show_panel(
+                        ui,
+                        &stats::PanelContext {
+                            stats: &session.stats,
+                            conn_state: conn,
+                            rates,
+                            duration,
+                            paused,
+                        },
+                    );
+                });
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(p.bg))
+            .show(ui, |ui| {
+                let area = ui.max_rect();
+                match &self.texture {
+                    Some(tex) => self.paint_remote_screen(ui, tex, area),
+                    None if state != ConnState::Failed => {
+                        self.show_waiting_for_frames(&ctx, area, conn.peer_paused());
+                    }
+                    None => {}
+                }
+
+                match state {
+                    ConnState::Failed => {
+                        ui.painter().rect_filled(area, 0.0, p.bg.gamma_multiply(0.85));
+                        self.show_session_ended(&ctx, area, conn.peer_left(), &mut actions);
+                    }
+                    ConnState::Reconnecting => {
+                        ui.painter().rect_filled(area, 0.0, p.bg.gamma_multiply(0.5));
+                        let elapsed = conn.since().elapsed().as_secs();
+                        let attempt = conn.reconnect_attempt();
+                        let text = if attempt > 0 {
+                            format!(
+                                "Connection lost \u{2014} reconnecting, attempt {attempt} of \
+                                 {MAX_RECONNECT_ATTEMPTS} \u{00B7} {elapsed}s"
+                            )
+                        } else {
+                            format!("Connection lost \u{2014} reconnecting \u{00B7} {elapsed}s")
+                        };
+                        banner(&ctx, area, StatusKind::Warning, text);
+                    }
+                    ConnState::Connected if has_frame && conn.peer_paused() => {
+                        banner(
+                            &ctx,
+                            area,
+                            StatusKind::Neutral,
+                            "Your peer paused sharing \u{2014} this is their last frame",
+                        );
+                    }
+                    _ => {}
+                }
+            });
+
+        for action in actions {
+            match action {
+                ViewerAction::Disconnect => self.cancel_session(),
+                ViewerAction::Reconnect => self.reconnect(),
+                ViewerAction::SetFullscreen(on) => self.set_fullscreen(on),
+                ViewerAction::SetZoom(zoom) => self.viewer.zoom = zoom,
+                ViewerAction::ToggleStats => self.viewer.show_stats = !self.viewer.show_stats,
+                ViewerAction::SetPaused(on) => session.set_paused(on),
+            }
+        }
+    }
+
+    /// Moves the newest remote frame and outgoing still (if either changed)
+    /// into their textures.
+    fn upload_frames(&mut self, ctx: &egui::Context, session: &SessionHandle) {
+        let remote = session.frame_buffer.lock().unwrap().take();
+        if let Some(decoded) = remote {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [decoded.width as usize, decoded.height as usize],
+                &decoded.rgba,
+            );
+            match &mut self.texture {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.texture =
+                        Some(ctx.load_texture("remote_screen", image, egui::TextureOptions::LINEAR));
                 }
             }
         }
 
-        let state = self
-            .conn_state
-            .as_ref()
-            .map(|cs| cs.get())
-            .unwrap_or(ConnState::Connecting);
-
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            ui.add_space(theme::space::XS);
-            ui.horizontal(|ui| {
-                let (kind, text) = match state {
-                    ConnState::Connected => (StatusKind::Positive, "Connected"),
-                    ConnState::Reconnecting => (StatusKind::Warning, "Reconnecting..."),
-                    ConnState::Failed => (StatusKind::Negative, "Disconnected"),
-                    ConnState::Connecting => (StatusKind::Warning, "Connecting..."),
-                };
-                widgets::status_pill(ui, kind, text);
-
-                if let Some(ice) = self.conn_state.as_ref().and_then(|cs| cs.get_ice_info()) {
-                    if ice.relay {
-                        widgets::status_pill(ui, StatusKind::Neutral, "Relayed (TURN)");
-                    } else {
-                        widgets::status_pill(
-                            ui,
-                            StatusKind::Positive,
-                            format!("Direct ({})", ice.local_type),
-                        );
-                    }
+        let outgoing = session.outgoing_preview.lock().unwrap().take();
+        if let Some(still) = outgoing {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [still.width as usize, still.height as usize],
+                &still.rgba,
+            );
+            match &mut self.viewer.outgoing_preview {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.viewer.outgoing_preview = Some(ctx.load_texture(
+                        "outgoing_preview",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
                 }
+            }
+        }
+    }
+
+    /// Keyboard shortcuts, plus the activity clock that decides when
+    /// fullscreen hides the bars.
+    fn track_viewer_input(&mut self, ctx: &egui::Context) {
+        let (active, f11, escape, os_fullscreen) = ctx.input(|i| {
+            let active = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::MouseWheel { .. }
+                        | egui::Event::Key { .. }
+                )
             });
-            ui.add_space(theme::space::XS);
+            (
+                active,
+                i.key_pressed(egui::Key::F11),
+                i.key_pressed(egui::Key::Escape),
+                i.viewport().fullscreen,
+            )
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(tex) = &self.texture {
-                let available = ui.available_size();
-                let tex_size = tex.size_vec2();
+        // Keep in step if fullscreen changed some way other than our
+        // buttons (e.g. the OS), so the next toggle isn't a no-op.
+        if let Some(on) = os_fullscreen {
+            self.viewer.fullscreen = on;
+        }
+        if active {
+            self.viewer.last_activity = Instant::now();
+        }
+        if f11 {
+            self.set_fullscreen(!self.viewer.fullscreen);
+        } else if escape {
+            self.set_fullscreen(false);
+        }
+    }
 
-                let scale = (available.x / tex_size.x).min(available.y / tex_size.y);
-                let display_size = egui::vec2(tex_size.x * scale, tex_size.y * scale);
+    fn paint_remote_screen(&self, ui: &mut egui::Ui, tex: &TextureHandle, area: Rect) {
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let tex_size = tex.size_vec2();
+        match self.viewer.zoom {
+            Zoom::Fit => {
+                let scale = (area.width() / tex_size.x).min(area.height() / tex_size.y);
+                let rect = Rect::from_center_size(area.center(), tex_size * scale);
+                ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+            }
+            Zoom::Actual => {
+                // Texture pixels are physical; the layout is in points.
+                let size = tex_size / ui.ctx().pixels_per_point();
+                egui::ScrollArea::both()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            size.max(ui.available_size()),
+                            egui::Sense::hover(),
+                        );
+                        let rect = Rect::from_center_size(rect.center(), size);
+                        ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+                    });
+            }
+        }
+    }
 
-                ui.centered_and_justified(|ui| {
-                    ui.image(egui::load::SizedTexture::new(tex.id(), display_size));
-                });
+    /// Connected, but nothing to draw yet.
+    fn show_waiting_for_frames(&self, ctx: &egui::Context, area: Rect, peer_paused: bool) {
+        let waited = self.viewer.connected_at.elapsed();
+        centered_overlay(ctx, "waiting_for_frames", area, |ui| {
+            let p = theme::palette_for(ui);
+            if peer_paused {
+                ui.label("Your peer has paused sharing.");
+                ui.colored_label(p.ink_3, "Their screen will appear here when they resume.");
+                return;
+            }
+            ui.spinner();
+            ui.add_space(theme::space::SM);
+            ui.label("Waiting for your peer's screen\u{2026}");
+            if waited >= NO_FRAMES_HINT_AFTER {
+                ui.add_space(theme::space::SM);
+                ui.colored_label(
+                    p.ink_3,
+                    "Nothing has arrived yet. If the window they're sharing is \
+                     minimised, Windows sends nothing for it until it's restored.",
+                );
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Waiting for remote screen...");
-                });
+                ctx.request_repaint_after(NO_FRAMES_HINT_AFTER - waited);
             }
         });
+    }
+
+    /// The card over a dimmed last frame once the connection is gone for good.
+    fn show_session_ended(
+        &self,
+        ctx: &egui::Context,
+        area: Rect,
+        peer_left: bool,
+        actions: &mut Vec<ViewerAction>,
+    ) {
+        let (title, body) = if peer_left {
+            ("Your peer ended the session", "They disconnected on their side.")
+        } else {
+            (
+                "The connection was lost",
+                "Reconnecting on its own didn't work, so the session has ended.",
+            )
+        };
+        let how = match self.role {
+            Role::Create => "Reconnect reopens the same code \u{2014} your peer presses Reconnect too.",
+            Role::Join => "Reconnect joins the same code again once your peer reopens it.",
+        };
+
+        centered_overlay(ctx, "session_ended", area, |ui| {
+            widgets::card(ui, |ui| {
+                ui.set_width(OVERLAY_WIDTH);
+                let p = theme::palette_for(ui);
+                ui.heading(title);
+                ui.add_space(theme::space::XS);
+                ui.colored_label(p.ink_2, body);
+                ui.colored_label(p.ink_3, how);
+                ui.add_space(theme::space::MD);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, true, "Reconnect").clicked() {
+                        actions.push(ViewerAction::Reconnect);
+                    }
+                    if widgets::secondary_button(ui, "Back to setup").clicked() {
+                        actions.push(ViewerAction::Disconnect);
+                    }
+                });
+            });
+        });
+    }
+
+    /// The bottom bar: what is going out, as a live still, and the control
+    /// to stop it.
+    fn show_sharing_bar(
+        &self,
+        ui: &mut egui::Ui,
+        state: ConnState,
+        paused: bool,
+        actions: &mut Vec<ViewerAction>,
+    ) {
+        let p = theme::palette_for(ui);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(SHARING_THUMB, egui::Sense::hover());
+            ui.painter().rect_filled(rect, 4.0, p.surface_2);
+            if let Some(tex) = &self.viewer.outgoing_preview {
+                let scale = (rect.width() / tex.size_vec2().x).min(rect.height() / tex.size_vec2().y);
+                let draw = Rect::from_center_size(rect.center(), tex.size_vec2() * scale);
+                let tint = if paused || state == ConnState::Failed {
+                    egui::Color32::from_gray(110)
+                } else {
+                    egui::Color32::WHITE
+                };
+                let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex.id(), draw, uv, tint);
+            }
+            ui.add_space(theme::space::XS);
+
+            let header = match (state, paused) {
+                (ConnState::Failed, _) => "Stopped sharing",
+                (_, true) => "Sharing paused",
+                _ => "You're sharing",
+            };
+            let label = self.sharing_label();
+
+            // Button first, from the right, so the title truncates into
+            // whatever is left rather than running under it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if state != ConnState::Failed {
+                    if paused {
+                        if widgets::primary_button(ui, true, "Resume sharing").clicked() {
+                            actions.push(ViewerAction::SetPaused(false));
+                        }
+                    } else if widgets::secondary_button(ui, "Pause sharing")
+                        .on_hover_text("Stop sending your screen without ending the session")
+                        .clicked()
+                    {
+                        actions.push(ViewerAction::SetPaused(true));
+                    }
+                }
+                ui.add_space(theme::space::SM);
+                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    widgets::section_header(ui, header);
+                    ui.add(egui::Label::new(egui::RichText::new(&label).strong()).truncate())
+                        .on_hover_text(&label);
+                });
+            });
+        });
+    }
+
+    fn sharing_label(&self) -> String {
+        self.active_share
+            .as_ref()
+            .map(|s| s.label.clone())
+            .unwrap_or_default()
     }
 
     fn show_error(&mut self, ui: &mut egui::Ui) {
@@ -848,6 +1322,57 @@ fn grouped_code(code: &str) -> String {
     }
 }
 
+/// The toolbar's connection pill: what state the link is in, and — while
+/// reconnecting — how far through its retries.
+fn connection_status(conn: &crate::transport::SharedConnState) -> (StatusKind, String) {
+    match conn.get() {
+        ConnState::Connecting => (StatusKind::Warning, "Connecting\u{2026}".into()),
+        ConnState::Connected => (StatusKind::Positive, "Connected".into()),
+        ConnState::Reconnecting => match conn.reconnect_attempt() {
+            0 => (StatusKind::Warning, "Reconnecting\u{2026}".into()),
+            n => (
+                StatusKind::Warning,
+                format!("Reconnecting ({n}/{MAX_RECONNECT_ATTEMPTS})"),
+            ),
+        },
+        ConnState::Failed if conn.peer_left() => (StatusKind::Negative, "Peer left".into()),
+        ConnState::Failed => (StatusKind::Negative, "Disconnected".into()),
+    }
+}
+
+/// Lays `add_contents` out centred over `area` (the remote screen), sized
+/// to its content. An `Area` rather than a child `Ui`, because egui can't
+/// vertically centre a column of widgets inside a panel without knowing
+/// their height first.
+fn centered_overlay(
+    ctx: &egui::Context,
+    id: &str,
+    area: Rect,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Area::new(egui::Id::new(id))
+        .pivot(egui::Align2::CENTER_CENTER)
+        .fixed_pos(area.center())
+        .show(ctx, |ui| {
+            ui.set_max_width(OVERLAY_WIDTH);
+            ui.vertical_centered(add_contents);
+        });
+}
+
+/// A status line pinned to the top of the remote screen.
+fn banner(ctx: &egui::Context, area: Rect, kind: StatusKind, text: impl Into<String>) {
+    egui::Area::new(egui::Id::new("viewer_banner"))
+        .pivot(egui::Align2::CENTER_TOP)
+        .fixed_pos(area.center_top() + egui::vec2(0.0, theme::space::MD))
+        .interactable(false)
+        .show(ctx, |ui| {
+            // An Area starts out narrow; without this the one-line status
+            // wraps inside its pill.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            widgets::status_pill(ui, kind, text);
+        });
+}
+
 /// The share link without its scheme — the part worth reading.
 fn display_link(link: &str) -> String {
     link.strip_prefix("https://")
@@ -900,7 +1425,7 @@ impl eframe::App for App {
             }
             Phase::Setup | Phase::Error => {}
             Phase::Viewing => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                ctx.request_repaint_after(VIEWING_TICK);
             }
             _ => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -909,6 +1434,16 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Closing the window mid-session is the most common way to hang up.
+        // Give the session thread a moment to say goodbye, so the peer sees
+        // "ended the session" now instead of minutes of reconnect attempts.
+        if let (Some(session), Some(cancel)) = (&self.session, self.session_cancel.take()) {
+            let _ = cancel.send(true);
+            let deadline = Instant::now() + EXIT_GOODBYE_WAIT;
+            while session.conn_state.get() != ConnState::Failed && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         if let Some(code) = &self.hosted_session_code {
             let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
             server.delete_session_blocking(code);

@@ -322,6 +322,15 @@ impl SignalingServer {
         }
     }
 
+    /// Delete a session from the signaling server. Best effort: a session
+    /// left behind expires on the server's own alarm.
+    pub async fn delete_session(&self, code: &str) {
+        let url = format!("{}/api/session/{}", self.base_url, code);
+        if let Err(e) = self.client.delete(&url).send().await {
+            tracing::warn!("Failed to delete session {code}: {e}");
+        }
+    }
+
     /// Delete a session from the signaling server (blocking, for use on app exit).
     pub fn delete_session_blocking(&self, code: &str) {
         let url = format!("{}/api/session/{}", self.base_url, code);

@@ -44,6 +44,10 @@ fn is_valid_pin(pin: &str) -> bool {
 fn main() -> Result<()> {
     let args = CliArgs::parse();
 
+    // Must happen before any TLS or DTLS: with two providers compiled in,
+    // rustls panics on first use rather than guess (see Cargo.toml).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

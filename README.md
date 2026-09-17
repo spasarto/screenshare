@@ -60,6 +60,14 @@ screenshare --client --process notepad --pin 123456abcd
 
 When `--process` is specified, the app waits for a matching window to appear and selects it automatically.
 
+### During a session
+
+The toolbar shows the connection state and path (direct or relayed), and has **Fit** / **1:1** zoom, **Stats** (frame rate, bitrate and resolution each way, round-trip time, session length), **Fullscreen** (<kbd>F11</kbd>; <kbd>Esc</kbd> leaves it, and the bars hide once the pointer rests) and **Disconnect**.
+
+The bar along the bottom shows what you're sending, with **Pause sharing** to stop sending without ending the session. The peer's screen says when you've paused.
+
+Disconnecting, or closing the window, tells the peer straight away. If the link drops instead, the viewer shows the reconnect attempts as they happen. Once they run out, **Reconnect** starts the same session again: the host reopens the same code and the joiner looks it up, so both sides press Reconnect and nobody retypes anything.
+
 ## Architecture
 
 ```
@@ -84,7 +92,7 @@ A Cloudflare Worker (`worker/`) handles initial session setup:
 
 1. **Create session** — generates a session code, provisions TURN credentials, and stores the (encrypted) SDP offer/answer in a Durable Object. A per-IP rate limit on the code-gated endpoints makes brute-forcing a code infeasible.
 2. **Join session** — the other peer polls for the offer, uploads its answer.
-3. After the WebRTC connection is established, all further signaling (ICE restarts) happens in-band over the data channel.
+3. After the WebRTC connection is established, the host deletes the session from the server. All further signaling happens in-band over the data channel: ICE restarts, plus session control messages (hang-up, pause/resume, round-trip pings; see `src/transport/control.rs`).
 
 It also serves `GET /j/:code`, the landing page behind the share link and QR. That page is static — it neither creates nor looks up the session, so opening a link costs nothing from the rate-limit budget and reveals nothing about whether the code exists.
 
