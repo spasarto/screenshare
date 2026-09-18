@@ -33,9 +33,16 @@ const COPIED_FOR: Duration = Duration::from_secs(2);
 /// beside the link and the share preview without pushing Cancel off screen.
 const QR_SIZE: f32 = 112.0;
 
-/// In fullscreen, how long the pointer has to sit still before the toolbar
-/// and sharing bar get out of the way.
-const CHROME_IDLE_HIDE: Duration = Duration::from_millis(2500);
+/// In fullscreen, how long the pointer has to sit still before it's hidden.
+const CURSOR_IDLE_HIDE: Duration = Duration::from_millis(2500);
+
+/// In fullscreen, how close to the top or bottom edge the pointer has to get
+/// to bring that edge's bar back.
+const EDGE_REVEAL: f32 = 6.0;
+
+/// Once a fullscreen bar is out, how far past it the pointer can stray
+/// before it tucks away again, so a slightly loose hand doesn't flicker it.
+const EDGE_HOLD_SLACK: f32 = 24.0;
 
 /// How long "Waiting for your peer's screen" waits before offering reasons.
 const NO_FRAMES_HINT_AFTER: Duration = Duration::from_secs(15);
@@ -108,10 +115,35 @@ struct ViewerState {
     show_stats: bool,
     fullscreen: bool,
     connected_at: Instant,
-    /// Last pointer or key input, for hiding the bars in fullscreen.
+    /// Last pointer or key input, for hiding the cursor in fullscreen.
     last_activity: Instant,
+    /// The toolbar and sharing bar while fullscreen, where each floats over
+    /// the screen only while the pointer is at its edge.
+    top_bar: EdgeBar,
+    bottom_bar: EdgeBar,
     sampler: stats::Sampler,
     outgoing_preview: Option<TextureHandle>,
+}
+
+/// A fullscreen bar that slides in when the pointer reaches its edge of the
+/// screen and tucks away once the pointer leaves it.
+#[derive(Clone, Copy)]
+struct EdgeBar {
+    shown: bool,
+    /// Height as last drawn, so the hold zone matches the bar.
+    height: f32,
+}
+
+impl EdgeBar {
+    const HIDDEN: Self = Self { shown: false, height: 44.0 };
+
+    /// `from_edge` is how far the pointer is from this bar's screen edge, or
+    /// `None` when it's off the window.
+    fn update(&mut self, from_edge: Option<f32>) {
+        self.shown = from_edge.is_some_and(|d| {
+            d <= EDGE_REVEAL || (self.shown && d <= self.height + EDGE_HOLD_SLACK)
+        });
+    }
 }
 
 impl ViewerState {
@@ -122,6 +154,8 @@ impl ViewerState {
             fullscreen: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            top_bar: EdgeBar::HIDDEN,
+            bottom_bar: EdgeBar::HIDDEN,
             sampler: stats::Sampler::default(),
             outgoing_preview: None,
         }
@@ -854,103 +888,82 @@ impl App {
             self.viewer.connected_at.elapsed()
         };
 
-        // In fullscreen the bars get out of the way once the pointer rests —
-        // but never while something needs the user's attention.
+        // In fullscreen the bars float over the screen, each only while the
+        // pointer is at its edge — but both stay up while something needs
+        // the user's attention.
+        let needs_attention = state != ConnState::Connected || !has_frame;
+        let (show_top, show_bottom) = if fullscreen {
+            let screen = ctx.content_rect();
+            let pointer = ctx.input(|i| i.pointer.hover_pos());
+            self.viewer.top_bar.update(pointer.map(|p| p.y - screen.top()));
+            self.viewer.bottom_bar.update(pointer.map(|p| screen.bottom() - p.y));
+            (
+                needs_attention || self.viewer.top_bar.shown,
+                needs_attention || self.viewer.bottom_bar.shown,
+            )
+        } else {
+            (true, true)
+        };
+
         let idle_for = self.viewer.last_activity.elapsed();
-        let chrome_visible = !fullscreen
-            || idle_for < CHROME_IDLE_HIDE
-            || state != ConnState::Connected
-            || !has_frame;
-        if !chrome_visible {
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-        } else if fullscreen && idle_for < CHROME_IDLE_HIDE {
-            ctx.request_repaint_after(CHROME_IDLE_HIDE - idle_for);
+        if fullscreen && !show_top && !show_bottom {
+            if idle_for >= CURSOR_IDLE_HIDE {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            } else {
+                ctx.request_repaint_after(CURSOR_IDLE_HIDE - idle_for);
+            }
         }
 
         let mut actions: Vec<ViewerAction> = Vec::new();
         let p = theme::palette_for(ui);
 
-        if chrome_visible {
+        // Docked, the bars push the remote screen aside; that's also how
+        // they come back in fullscreen when they're held up, so the banners
+        // pinned to the top of the screen stay clear of them.
+        if !fullscreen || needs_attention {
             egui::Panel::top("viewer_toolbar").show(ui, |ui| {
-                ui.add_space(theme::space::XS);
-                ui.horizontal(|ui| {
-                    let (kind, text) = connection_status(conn);
-                    widgets::status_pill(ui, kind, text);
-                    if state == ConnState::Connected
-                        && let Some(ice) = conn.get_ice_info()
-                    {
-                        if ice.relay {
-                            widgets::status_pill(ui, StatusKind::Neutral, "Relayed (TURN)")
-                                .on_hover_text("Traffic goes through a relay server");
-                        } else {
-                            widgets::status_pill(ui, StatusKind::Positive, "Direct")
-                                .on_hover_text(format!("Peer-to-peer ({})", ice.local_type));
-                        }
-                    }
-                    ui.colored_label(
-                        p.ink_3,
-                        stats::format_duration(duration),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if widgets::danger_button(ui, "Disconnect")
-                            .on_hover_text("End the session for both of you")
-                            .clicked()
-                        {
-                            actions.push(ViewerAction::Disconnect);
-                        }
-                        let (label, hint) = if fullscreen {
-                            ("Exit fullscreen", "F11 or Esc")
-                        } else {
-                            ("Fullscreen", "F11")
-                        };
-                        if widgets::secondary_button(ui, label).on_hover_text(hint).clicked() {
-                            actions.push(ViewerAction::SetFullscreen(!fullscreen));
-                        }
-                        if widgets::toggle_button(ui, self.viewer.show_stats, "Stats").clicked() {
-                            actions.push(ViewerAction::ToggleStats);
-                        }
-                        ui.add_space(theme::space::SM);
-                        // Right-to-left, so "1:1" first reads as "Fit  1:1".
-                        let zoom = self.viewer.zoom;
-                        if widgets::toggle_button(ui, zoom == Zoom::Actual, "1:1")
-                            .on_hover_text("Actual size: one remote pixel per screen pixel")
-                            .clicked()
-                        {
-                            actions.push(ViewerAction::SetZoom(Zoom::Actual));
-                        }
-                        if widgets::toggle_button(ui, zoom == Zoom::Fit, "Fit")
-                            .on_hover_text("Scale to fit the window")
-                            .clicked()
-                        {
-                            actions.push(ViewerAction::SetZoom(Zoom::Fit));
-                        }
-                    });
-                });
-                ui.add_space(theme::space::XS);
+                self.show_toolbar(ui, state, duration, &mut actions);
             });
-
             egui::Panel::bottom("sharing_bar").show(ui, |ui| {
                 ui.add_space(theme::space::XS);
                 self.show_sharing_bar(ui, state, paused, &mut actions);
                 ui.add_space(theme::space::XS);
             });
         } else {
-            // The bars are hidden, but what's going out never is.
-            let label = self.sharing_label();
-            egui::Area::new(egui::Id::new("sharing_reminder"))
-                .anchor(
-                    egui::Align2::LEFT_BOTTOM,
-                    egui::vec2(theme::space::MD, -theme::space::MD),
-                )
-                .interactable(false)
-                .show(&ctx, |ui| {
-                    if paused {
-                        widgets::status_pill(ui, StatusKind::Warning, "Sharing paused");
-                    } else {
-                        widgets::status_pill(ui, StatusKind::Positive, format!("Sharing {label}"));
-                    }
-                });
+            if show_top {
+                self.viewer.top_bar.height =
+                    edge_overlay(&ctx, "viewer_toolbar_overlay", egui::Align2::LEFT_TOP, |ui| {
+                        self.show_toolbar(ui, state, duration, &mut actions);
+                    });
+            }
+            if show_bottom {
+                self.viewer.bottom_bar.height =
+                    edge_overlay(&ctx, "sharing_bar_overlay", egui::Align2::LEFT_BOTTOM, |ui| {
+                        ui.add_space(theme::space::XS);
+                        self.show_sharing_bar(ui, state, paused, &mut actions);
+                        ui.add_space(theme::space::XS);
+                    });
+            } else {
+                // The bar is tucked away, but what's going out never is.
+                let label = self.sharing_label();
+                egui::Area::new(egui::Id::new("sharing_reminder"))
+                    .anchor(
+                        egui::Align2::LEFT_BOTTOM,
+                        egui::vec2(theme::space::MD, -theme::space::MD),
+                    )
+                    .interactable(false)
+                    .show(&ctx, |ui| {
+                        if paused {
+                            widgets::status_pill(ui, StatusKind::Warning, "Sharing paused");
+                        } else {
+                            widgets::status_pill(
+                                ui,
+                                StatusKind::Positive,
+                                format!("Sharing {label}"),
+                            );
+                        }
+                    });
+            }
         }
 
         if self.viewer.show_stats {
@@ -1195,6 +1208,77 @@ impl App {
         });
     }
 
+    /// The top bar: connection status, session length, and the view and
+    /// session controls.
+    fn show_toolbar(
+        &self,
+        ui: &mut egui::Ui,
+        state: ConnState,
+        duration: Duration,
+        actions: &mut Vec<ViewerAction>,
+    ) {
+        let Some(session) = &self.session else { return };
+        let conn = &session.conn_state;
+        let fullscreen = self.viewer.fullscreen;
+        let p = theme::palette_for(ui);
+        ui.add_space(theme::space::XS);
+        ui.horizontal(|ui| {
+            let (kind, text) = connection_status(conn);
+            widgets::status_pill(ui, kind, text);
+            if state == ConnState::Connected
+                && let Some(ice) = conn.get_ice_info()
+            {
+                if ice.relay {
+                    widgets::status_pill(ui, StatusKind::Neutral, "Relayed (TURN)")
+                        .on_hover_text("Traffic goes through a relay server");
+                } else {
+                    widgets::status_pill(ui, StatusKind::Positive, "Direct")
+                        .on_hover_text(format!("Peer-to-peer ({})", ice.local_type));
+                }
+            }
+            ui.colored_label(
+                p.ink_3,
+                stats::format_duration(duration),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::danger_button(ui, "Disconnect")
+                    .on_hover_text("End the session for both of you")
+                    .clicked()
+                {
+                    actions.push(ViewerAction::Disconnect);
+                }
+                let (label, hint) = if fullscreen {
+                    ("Exit fullscreen", "F11 or Esc")
+                } else {
+                    ("Fullscreen", "F11")
+                };
+                if widgets::secondary_button(ui, label).on_hover_text(hint).clicked() {
+                    actions.push(ViewerAction::SetFullscreen(!fullscreen));
+                }
+                if widgets::toggle_button(ui, self.viewer.show_stats, "Stats").clicked() {
+                    actions.push(ViewerAction::ToggleStats);
+                }
+                ui.add_space(theme::space::SM);
+                // Right-to-left, so "1:1" first reads as "Fit  1:1".
+                let zoom = self.viewer.zoom;
+                if widgets::toggle_button(ui, zoom == Zoom::Actual, "1:1")
+                    .on_hover_text("Actual size: one remote pixel per screen pixel")
+                    .clicked()
+                {
+                    actions.push(ViewerAction::SetZoom(Zoom::Actual));
+                }
+                if widgets::toggle_button(ui, zoom == Zoom::Fit, "Fit")
+                    .on_hover_text("Scale to fit the window")
+                    .clicked()
+                {
+                    actions.push(ViewerAction::SetZoom(Zoom::Fit));
+                }
+            });
+        });
+        ui.add_space(theme::space::XS);
+    }
+
     /// The bottom bar: what is going out, as a live still, and the control
     /// to stop it.
     fn show_sharing_bar(
@@ -1357,6 +1441,38 @@ fn centered_overlay(
             ui.set_max_width(OVERLAY_WIDTH);
             ui.vertical_centered(add_contents);
         });
+}
+
+/// A full-width bar floating over one edge of the screen, drawn like a panel
+/// but without pushing the remote screen aside. Returns its height.
+fn edge_overlay(
+    ctx: &egui::Context,
+    id: &str,
+    edge: egui::Align2,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> f32 {
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Foreground)
+        .anchor(edge, Vec2::ZERO)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::side_top_panel(ui.style());
+            frame.show(ui, |ui| {
+                ui.set_width(screen.width() - frame.total_margin().sum().x);
+                add_contents(ui);
+            });
+            // The divider a docked panel would draw on its inner edge.
+            let rect = ui.min_rect();
+            let y = if edge.y() == egui::Align::Min { rect.bottom() } else { rect.top() };
+            ui.painter().hline(
+                rect.x_range(),
+                y,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+            );
+        })
+        .response
+        .rect
+        .height()
 }
 
 /// A status line pinned to the top of the remote screen.
