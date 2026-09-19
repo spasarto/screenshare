@@ -3,6 +3,7 @@
 mod app;
 mod capture;
 mod codec;
+mod diag;
 mod failure;
 mod logging;
 mod signaling_server;

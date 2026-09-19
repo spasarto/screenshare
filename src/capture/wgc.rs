@@ -1,4 +1,5 @@
 use super::{CaptureTarget, Frame};
+use crate::diag;
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,9 +54,12 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         frame: &mut frame::Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        diag::CAP_ARRIVED.inc();
+
         // Paused: drop the frame before paying for the GPU readback, so
         // nothing reaches the encoder and it goes idle.
         if self.paused.load(Ordering::Relaxed) {
+            diag::CAP_SKIP_PAUSED.inc();
             return Ok(());
         }
 
@@ -67,6 +71,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             .last_kept
             .is_some_and(|t| now.duration_since(t) < self.min_interval.mul_f64(FRAME_INTERVAL_SLACK))
         {
+            diag::CAP_SKIP_RATE.inc();
             return Ok(());
         }
         self.last_kept = Some(now);
@@ -74,8 +79,12 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let width = frame.width();
         let height = frame.height();
 
+        let readback_start = Instant::now();
         let buffer = frame.buffer()?;
         let data = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
+        let readback = readback_start.elapsed();
+        diag::CAP_READBACK_US.add_time(readback);
+        diag::CAP_READBACK_MAX_US.max_time(readback);
 
         let frame = Frame {
             width,
@@ -85,7 +94,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         };
 
         // Non-blocking send; drop frame if the channel is full
-        let _ = self.tx.try_send(frame);
+        match self.tx.try_send(frame) {
+            Ok(()) => diag::CAP_KEPT.inc(),
+            Err(_) => diag::CAP_DROP_FULL.inc(),
+        }
         Ok(())
     }
 

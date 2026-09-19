@@ -1238,8 +1238,10 @@ impl App {
     /// Moves the newest remote frame and outgoing still (if either changed)
     /// into their textures.
     fn upload_frames(&mut self, ctx: &egui::Context, session: &SessionHandle) {
+        crate::diag::GUI_PAINTS.inc();
         let remote = session.frame_buffer.lock().unwrap().take();
         if let Some(decoded) = remote {
+            let upload_start = std::time::Instant::now();
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [decoded.width as usize, decoded.height as usize],
                 &decoded.rgba,
@@ -1251,6 +1253,8 @@ impl App {
                         Some(ctx.load_texture("remote_screen", image, egui::TextureOptions::LINEAR));
                 }
             }
+            crate::diag::GUI_UPLOADS.inc();
+            crate::diag::GUI_UPLOAD_US.add_time(upload_start.elapsed());
         }
 
         let outgoing = session.outgoing_preview.lock().unwrap().take();

@@ -1,4 +1,5 @@
 use crate::app::Role;
+use crate::diag;
 use crate::transport::signaling::{self, SignalingBlob};
 use crate::transport::control::Control;
 use crate::transport::{ConnState, SessionStats, SharedConnState};
@@ -187,7 +188,13 @@ impl PeerConnection {
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let tx = tx.clone();
             Box::pin(async move {
+                diag::RCV_MSGS.inc();
+                diag::RCV_BYTES.add(msg.data.len() as u64);
+                // Time spent waiting here is time the SCTP stack can't
+                // deliver the next message: the decoder isn't keeping up.
+                let wait_start = std::time::Instant::now();
                 let _ = tx.send(msg.data.to_vec()).await;
+                diag::RCV_QUEUE_WAIT_US.add_time(wait_start.elapsed());
             })
         }));
     }
@@ -343,8 +350,11 @@ pub fn spawn_sender(
         tracing::info!("Data channel ready, starting to send frames");
 
         while let Some(data) = outgoing_rx.recv().await {
+            diag::SND_IN.inc();
+
             // Drop frames while reconnecting
             if conn_state.get() != ConnState::Connected {
+                diag::SND_DROP_STATE.inc();
                 continue;
             }
 
@@ -356,24 +366,42 @@ pub fn spawn_sender(
                 let dc_guard = dc_holder.lock().await;
                 dc_guard.clone()
             };
-            let Some(dc) = dc else { continue };
+            let Some(dc) = dc else {
+                diag::SND_DROP_NO_DC.inc();
+                continue;
+            };
 
             // The link can't keep up with the encoder; drop this frame
             // rather than let the SCTP send queue grow without bound.
-            if dc.buffered_amount().await > MAX_BUFFERED_AMOUNT {
+            let buffered = dc.buffered_amount().await;
+            diag::SND_MAX_BUFFERED.max(buffered as u64);
+            if buffered > MAX_BUFFERED_AMOUNT {
+                diag::SND_DROP_BUFFERED.inc();
+                tracing::debug!(
+                    "Dropping {} KB frame: {} KB already buffered",
+                    data.len() / 1024,
+                    buffered / 1024
+                );
                 continue;
             }
+
+            let send_start = std::time::Instant::now();
 
             let chunks = super::framing::encode_chunked(&data);
             let mut sent = true;
             for chunk in chunks {
                 if let Err(e) = dc.send(&bytes::Bytes::from(chunk)).await {
+                    diag::SND_ERR.inc();
                     tracing::warn!("Failed to send on data channel: {e}");
                     sent = false;
                     break;
                 }
             }
+            let send_time = send_start.elapsed();
+            diag::SND_SEND_US.add_time(send_time);
+            diag::SND_SEND_MAX_US.max_time(send_time);
             if sent {
+                diag::SND_SENT.inc();
                 stats.add_sent(data.len());
             }
         }

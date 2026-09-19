@@ -1,6 +1,7 @@
 use crate::capture;
 use crate::capture::CaptureTarget;
 use crate::codec::{H264Decoder, H264Encoder};
+use crate::diag;
 use crate::failure::{SessionFailure, Step};
 use crate::signaling_server::SignalingServer;
 use crate::transport::control::Control;
@@ -575,6 +576,8 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
         repaint,
     } = threads;
 
+    diag::start_reporter();
+
     let (capture_tx, capture_rx) =
         std::sync::mpsc::sync_channel::<capture::Frame>(FRAME_CHANNEL_SIZE);
 
@@ -586,6 +589,8 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
             let mut last_preview: Option<Instant> = None;
 
             while let Ok(frame) = capture_rx.recv() {
+                diag::ENC_IN.inc();
+                let scale_start = Instant::now();
                 let (w, h, scaled) = capture::scale_bgra(
                     &frame.data,
                     frame.width,
@@ -593,6 +598,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
                     quality.max_width,
                     quality.max_height,
                 );
+                diag::ENC_SCALE_US.add_time(scale_start.elapsed());
 
                 if encoder.is_none()
                     || encoder
@@ -619,13 +625,30 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
 
                 let enc = encoder.as_mut().unwrap();
 
-                match enc.encode(&scaled) {
+                let encode_start = Instant::now();
+                let result = enc.encode(&scaled);
+                let encode_time = encode_start.elapsed();
+                diag::ENC_ENCODE_US.add_time(encode_time);
+                diag::ENC_ENCODE_MAX_US.max_time(encode_time);
+                match result {
                     Ok(h264_data) => {
-                        if !h264_data.is_empty() {
+                        if h264_data.is_empty() {
+                            diag::ENC_EMPTY.inc();
+                        } else {
+                            diag::ENC_OUT.inc();
+                            diag::ENC_BYTES.add(h264_data.len() as u64);
+                            diag::ENC_MAX_BYTES.max(h264_data.len() as u64);
+                            if diag::has_idr(&h264_data) {
+                                diag::ENC_IDR.inc();
+                                tracing::debug!("Keyframe: {} KB", h264_data.len() / 1024);
+                            }
+                            let send_start = Instant::now();
                             let _ = encoded_tx.blocking_send(h264_data);
+                            diag::ENC_BLOCKED_US.add_time(send_start.elapsed());
                         }
                     }
                     Err(e) => {
+                        diag::ENC_ERR.inc();
                         tracing::warn!("Encode error: {e}");
                     }
                 }
@@ -684,19 +707,32 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
                     IncomingMessage::Pending => continue,
                 };
 
-                match decoder.decode(&h264_data) {
+                diag::DEC_IN.inc();
+                let decode_start = Instant::now();
+                let result = decoder.decode(&h264_data);
+                let decode_time = decode_start.elapsed();
+                diag::DEC_US.add_time(decode_time);
+                diag::DEC_MAX_US.max_time(decode_time);
+                match result {
                     Ok(Some((w, h, rgba))) => {
                         stats.add_received(h264_data.len());
                         stats.set_remote_size(w, h);
-                        *fb.lock().unwrap() = Some(DecodedFrame {
+                        diag::DEC_FRAME.inc();
+                        let mut slot = fb.lock().unwrap();
+                        if slot.is_some() {
+                            diag::DEC_OVERWRITTEN.inc();
+                        }
+                        *slot = Some(DecodedFrame {
                             width: w,
                             height: h,
                             rgba,
                         });
+                        drop(slot);
                         repaint();
                     }
-                    Ok(None) => {}
+                    Ok(None) => diag::DEC_NONE.inc(),
                     Err(e) => {
+                        diag::DEC_ERR.inc();
                         tracing::warn!("Decode error: {e}");
                     }
                 }
