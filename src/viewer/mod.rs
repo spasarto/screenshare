@@ -683,21 +683,42 @@ impl App {
 
     fn show_code_entry(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette_for(ui);
+        let letters_id = egui::Id::new("code_letters_field");
+        let mut submit = false;
         ui.horizontal(|ui| {
-            ui.add(
+            let digits_before = self.code_digits.chars().count();
+            let digits_response = ui.add(
                 egui::TextEdit::singleline(&mut self.code_digits)
                     .desired_width(104.0)
                     .font(egui::FontId::monospace(theme::size::LG))
                     .hint_text("000000"),
             );
+            // Once all 6 digits are in, jump straight to the letters field
+            // rather than making the user reach for Tab or the mouse.
+            if digits_response.changed()
+                && digits_before < 6
+                && self.code_digits.chars().count() >= 6
+            {
+                ui.memory_mut(|mem| mem.request_focus(letters_id));
+            }
+            if digits_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
             ui.label(egui::RichText::new("\u{00B7}").size(theme::size::LG).color(p.ink_3));
-            ui.add(
+            let letters_response = ui.add(
                 egui::TextEdit::singleline(&mut self.code_letters)
+                    .id(letters_id)
                     .desired_width(72.0)
                     .font(egui::FontId::monospace(theme::size::LG))
                     .hint_text("aaaa"),
             );
+            if letters_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
         });
+        if submit && self.can_start() {
+            self.handle_start();
+        }
     }
 
     fn handle_start(&mut self) {
