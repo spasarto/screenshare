@@ -66,6 +66,9 @@ pub static ENC_ERR: Counter = Counter::new();
 pub static ENC_BYTES: Counter = Counter::new();
 pub static ENC_MAX_BYTES: Counter = Counter::new();
 pub static ENC_IDR: Counter = Counter::new();
+/// NAL units produced, SPS/PPS included: well above ~1 per frame means the
+/// frame was split into slices the encoder could spread over threads.
+pub static ENC_NALS: Counter = Counter::new();
 pub static ENC_BLOCKED_US: Counter = Counter::new();
 
 // Sender task.
@@ -140,6 +143,7 @@ fn reporter() {
         let enc_bytes = ENC_BYTES.take();
         let enc_max_bytes = ENC_MAX_BYTES.take();
         let enc_idr = ENC_IDR.take();
+        let enc_nals = ENC_NALS.take();
         let enc_blocked = ENC_BLOCKED_US.take();
 
         let snd_in = SND_IN.take();
@@ -181,8 +185,9 @@ fn reporter() {
         );
         tracing::info!(
             "pipeline | encode: in {enc_in}, out {enc_out} (idr {enc_idr}), empty {enc_empty}, \
-             err {enc_err}, {:.2} Mbit, max frame {} KB, scale avg {:.1}ms, \
+             err {enc_err}, nals/frame {:.1}, {:.2} Mbit, max frame {} KB, scale avg {:.1}ms, \
              encode avg {:.1}ms max {:.1}ms, blocked on send queue {:.0}ms",
+            if enc_out == 0 { 0.0 } else { enc_nals as f64 / enc_out as f64 },
             enc_bytes as f64 * 8.0 / 1e6 / secs,
             enc_max_bytes / 1024,
             avg_ms(enc_scale, enc_in),

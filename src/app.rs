@@ -609,7 +609,11 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
                         .as_ref()
                         .is_some_and(|e| e.width() != w || e.height() != h)
                 {
-                    tracing::info!("Creating encoder for {w}x{h}");
+                    tracing::info!(
+                        "Creating encoder for {w}x{h} (captured {}x{})",
+                        frame.width,
+                        frame.height
+                    );
                     match H264Encoder::new(w, h, quality.fps) {
                         Ok(e) => {
                             encoder = Some(e);
