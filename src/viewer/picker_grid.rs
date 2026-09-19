@@ -27,6 +27,15 @@ pub enum Selection {
     Monitor(usize),
 }
 
+/// The picker's selection in a form that survives a restart: `HWND`s and
+/// list positions don't, so a window is remembered by what it is (process
+/// and title) and matched back by that.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SavedTarget {
+    Window { process: String, title: String },
+    Monitor { index: usize },
+}
+
 #[derive(Default)]
 struct TileArt {
     thumb: Option<TextureHandle>,
@@ -90,6 +99,46 @@ impl PickerGrid {
         match self.selection? {
             Selection::Window(i) => self.windows.get(i).map(|w| w.title.clone()),
             Selection::Monitor(i) => self.monitors.get(i).map(|m| m.label.clone()),
+        }
+    }
+
+    /// The current selection, for saving across runs.
+    pub fn saved_selection(&self) -> Option<SavedTarget> {
+        match self.selection? {
+            Selection::Window(i) => {
+                let w = self.windows.get(i)?;
+                Some(SavedTarget::Window {
+                    process: w.window.process_name().unwrap_or_default(),
+                    title: w.title.clone(),
+                })
+            }
+            Selection::Monitor(index) => Some(SavedTarget::Monitor { index }),
+        }
+    }
+
+    /// Selects what was shared last time, if it's still here: the same
+    /// window by title, or failing that another window of the same app
+    /// (titles change as documents do). Leaves the default selection alone
+    /// when nothing matches.
+    pub fn restore(&mut self, saved: &SavedTarget) {
+        let found = match saved {
+            SavedTarget::Window { process, title } => {
+                let same_app = |w: &&WindowInfo| {
+                    !process.is_empty()
+                        && w.window.process_name().is_ok_and(|p| p.eq_ignore_ascii_case(process))
+                };
+                self.windows
+                    .iter()
+                    .position(|w| same_app(&w) && w.title == *title)
+                    .or_else(|| self.windows.iter().position(|w| same_app(&w)))
+                    .map(Selection::Window)
+            }
+            SavedTarget::Monitor { index } => {
+                (*index < self.monitors.len()).then_some(Selection::Monitor(*index))
+            }
+        };
+        if found.is_some() {
+            self.selection = found;
         }
     }
 

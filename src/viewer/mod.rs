@@ -1,4 +1,6 @@
+mod log_drawer;
 mod picker_grid;
+mod settings;
 mod stats;
 mod theme;
 mod widgets;
@@ -6,10 +8,16 @@ mod widgets;
 use crate::CliArgs;
 use crate::app::{Repaint, SessionEvent, SessionHandle, Stage};
 use crate::capture::{CaptureTarget, picker};
+use crate::failure::{Recovery, SessionFailure};
+use crate::logging::LogBuffer;
+use crate::signaling_server::SignalingServer;
 use crate::transport::ConnState;
 use crate::transport::peer::MAX_RECONNECT_ATTEMPTS;
 use egui::{Rect, TextureHandle, Vec2};
-use picker_grid::PickerGrid;
+use log_drawer::LogDrawer;
+use picker_grid::{PickerGrid, SavedTarget};
+use serde::{Deserialize, Serialize};
+use settings::{Settings, SettingsPanel};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -22,8 +30,6 @@ const COLUMN_WIDTH: f32 = 420.0;
 /// Wider column used only by the two setup steps that need room for a
 /// two-card choice or a tile grid.
 const WIDE_COLUMN_WIDTH: f32 = 640.0;
-
-const SERVER_URL: &str = "https://screenshare.aghj.dev";
 
 /// How long a "Copied" confirmation stays up after a copy.
 const COPIED_FOR: Duration = Duration::from_secs(2);
@@ -58,6 +64,9 @@ const SHARING_THUMB: Vec2 = Vec2::new(64.0, 36.0);
 /// Width of the cards laid over the remote screen (session ended, waiting).
 const OVERLAY_WIDTH: f32 = 360.0;
 
+/// Height the error screen's Details text scrolls within.
+const DETAILS_MAX_HEIGHT: f32 = 96.0;
+
 /// Upper bound on how long closing the window waits for the peer to be told.
 /// Slightly over the session thread's own goodbye timeout.
 const EXIT_GOODBYE_WAIT: Duration = Duration::from_millis(600);
@@ -68,10 +77,24 @@ pub struct DecodedFrame {
     pub rgba: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Role {
     Create,
     Join,
+}
+
+/// What survives a restart, beyond the window's size and position (which
+/// eframe saves itself). Stored as one value so adding a field later reads
+/// old saves with that field at its default.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Persisted {
+    settings: Settings,
+    last_role: Option<Role>,
+    last_target: Option<SavedTarget>,
+    /// Set once a session has connected, which means the Windows Firewall
+    /// prompt (if any) has been and gone.
+    network_notice_seen: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -248,12 +271,41 @@ pub struct App {
     session_cancel: Option<watch::Sender<bool>>,
 
     // Error
-    error_message: String,
+    failure: Option<SessionFailure>,
+
+    // Settings, persistence and the log
+    settings: Settings,
+    settings_panel: SettingsPanel,
+    last_role: Option<Role>,
+    last_target: Option<SavedTarget>,
+    network_notice_seen: bool,
+    log: LogBuffer,
+    log_drawer: LogDrawer,
+    /// The server the in-flight or live session is using, fixed when it
+    /// starts: settings can change under a running session, and cleanup and
+    /// the share link have to go to the server the code actually lives on.
+    session_server_url: String,
+    /// The code the last hosted session asked for (`--pin`, or the previous
+    /// code on Reconnect), so Try again asks for the same one.
+    last_create_pin: Option<String>,
+    /// Closing while fullscreen leaves fullscreen first, so the window size
+    /// eframe saves on exit is the windowed one.
+    close_when_windowed: bool,
 }
 
 impl App {
-    pub fn new(args: CliArgs, cc: &eframe::CreationContext) -> Self {
+    pub fn new(args: CliArgs, log: LogBuffer, cc: &eframe::CreationContext) -> Self {
+        let persisted: Persisted = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
+            .unwrap_or_default();
+
         theme::install(&cc.egui_ctx);
+        cc.egui_ctx.set_theme(persisted.settings.theme.preference());
+        if persisted.settings.start_minimized {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
 
         // Determine role from CLI flags, defaulting to Create
         let role_fixed_by_cli = args.server || args.client;
@@ -262,6 +314,11 @@ impl App {
         } else {
             Role::Create
         };
+
+        let mut picker = PickerGrid::new();
+        if let Some(target) = &persisted.last_target {
+            picker.restore(target);
+        }
 
         // Pre-fill the code fields from --pin for client mode, split into
         // the same digits/letters groups the Join screen edits.
@@ -306,7 +363,7 @@ impl App {
             phase,
             setup_step,
             role_fixed_by_cli,
-            picker: PickerGrid::new(),
+            picker,
             role,
             code_digits,
             code_letters,
@@ -326,7 +383,17 @@ impl App {
             logo_texture,
             hosted_session_code: None,
             session_cancel: None,
-            error_message: String::new(),
+            failure: None,
+            session_server_url: persisted.settings.server_url(),
+            settings: persisted.settings,
+            settings_panel: SettingsPanel::default(),
+            last_role: persisted.last_role,
+            last_target: persisted.last_target,
+            network_notice_seen: persisted.network_notice_seen,
+            log,
+            log_drawer: LogDrawer::default(),
+            last_create_pin: None,
+            close_when_windowed: false,
         }
     }
 
@@ -384,10 +451,11 @@ impl App {
             let _ = tx.send(true);
         }
         if let Some(code) = self.hosted_session_code.take() {
-            let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
+            let server = SignalingServer::new(&self.session_server_url);
             std::thread::spawn(move || server.delete_session_blocking(&code));
         }
         self.event_rx = None;
+        self.failure = None;
         self.stage = Stage::ContactingServer;
         self.copied = None;
         self.session = None;
@@ -413,6 +481,50 @@ impl App {
         self.end_session();
         let create_pin = (self.role == Role::Create && crate::is_valid_pin(&code)).then_some(code);
         self.spawn_session(share, create_pin);
+    }
+
+    /// Runs the failed session again, the same way round and sharing the
+    /// same thing. `fresh_code` drops the code a host asked for, for the
+    /// failures where that code is the problem.
+    fn retry(&mut self, fresh_code: bool) {
+        let Some(share) = self.active_share.clone() else {
+            self.cancel_session();
+            return;
+        };
+        if let CaptureTarget::Window(window) = share.target
+            && !window.is_valid()
+        {
+            self.cancel_session();
+            return;
+        }
+        let pin = if fresh_code { None } else { self.last_create_pin.clone() };
+        // A code still held on the server has to go before it can be
+        // created again; `end_session`'s cleanup runs in the background and
+        // would race the new session's create.
+        if let (Some(pin), Some(hosted)) = (&pin, &self.hosted_session_code)
+            && pin == hosted
+        {
+            SignalingServer::new(&self.session_server_url).delete_session_blocking(hosted);
+            self.hosted_session_code = None;
+        }
+        self.end_session();
+        self.spawn_session(share, pin);
+    }
+
+    fn apply_recovery(&mut self, recovery: Recovery) {
+        match recovery {
+            Recovery::Retry => self.retry(false),
+            Recovery::NewCode => self.retry(true),
+            // The code fields are left as they were, so going back to the
+            // Join screen is checking the code.
+            Recovery::CheckCode | Recovery::PickAnother => self.cancel_session(),
+            Recovery::OpenSettings => self.settings_panel.open(&self.settings),
+        }
+    }
+
+    fn apply_settings(&mut self, settings: Settings) {
+        self.egui_ctx.set_theme(settings.theme.preference());
+        self.settings = settings;
     }
 
     fn set_fullscreen(&mut self, fullscreen: bool) {
@@ -443,10 +555,11 @@ impl App {
                     self.session = Some(session);
                     self.texture = None;
                     self.viewer.start_session();
+                    self.network_notice_seen = true;
                     self.phase = Phase::Viewing;
                 }
-                SessionEvent::Error(msg) => {
-                    self.error_message = msg;
+                SessionEvent::Error(failure) => {
+                    self.failure = Some(failure);
                     self.phase = Phase::Error;
                 }
             }
@@ -494,6 +607,7 @@ impl App {
                         "Start a session",
                         "Pick something to share and get a code to send your peer. \
                          They'll share their screen with you too.",
+                        self.last_role == Some(Role::Create),
                     )
                     .clicked()
                     {
@@ -505,6 +619,7 @@ impl App {
                         &mut columns[1],
                         "Join a session",
                         "Enter a code you were given, then pick what you'll share back.",
+                        self.last_role == Some(Role::Join),
                     )
                     .clicked()
                     {
@@ -597,6 +712,10 @@ impl App {
             return;
         }
         let label = self.picker.selected_label().unwrap_or_default();
+        if !self.role_fixed_by_cli {
+            self.last_role = Some(self.role);
+        }
+        self.last_target = self.picker.saved_selection();
         self.spawn_session(ActiveShare { target, label }, self.cli_pin.clone());
     }
 
@@ -626,12 +745,24 @@ impl App {
         let target = share.target;
         self.active_share = Some(share);
         self.stage = Stage::ContactingServer;
+        self.failure = None;
+        self.session_server_url = self.settings.server_url();
+        self.last_create_pin = create_pin.clone();
+        let quality = self.settings.quality();
+        tracing::info!(
+            "Starting session via {} at up to {}x{}, {} fps",
+            self.session_server_url,
+            quality.max_width,
+            quality.max_height,
+            quality.fps
+        );
 
         match self.role {
             Role::Create => {
                 crate::app::spawn_offerer(
-                    SERVER_URL.to_string(),
+                    self.session_server_url.clone(),
                     target,
+                    quality,
                     create_pin,
                     event_tx,
                     cancel_rx,
@@ -641,8 +772,9 @@ impl App {
             }
             Role::Join => {
                 crate::app::spawn_answerer(
-                    SERVER_URL.to_string(),
+                    self.session_server_url.clone(),
                     target,
+                    quality,
                     self.join_code(),
                     event_tx,
                     cancel_rx,
@@ -660,6 +792,7 @@ impl App {
                 ui.heading("Creating session");
                 ui.add_space(theme::space::MD);
                 widgets::progress_steps(ui, &self.progress_list());
+                self.show_network_notice(ui);
                 ui.add_space(theme::space::LG);
                 self.show_share_preview(ui);
                 ui.add_space(theme::space::LG);
@@ -724,7 +857,7 @@ impl App {
     /// The web link carrying the session code, so the peer can be handed a
     /// URL instead of ten characters to type.
     fn share_link(&self) -> String {
-        format!("{SERVER_URL}/j/{}", self.session_code)
+        format!("{}/j/{}", self.session_server_url, self.session_code)
     }
 
     fn show_waiting_for_process(&mut self, ui: &mut egui::Ui) {
@@ -795,8 +928,68 @@ impl App {
                 if widgets::secondary_button(ui, "Cancel").clicked() {
                     self.cancel_session();
                 }
+                self.show_network_notice(ui);
             });
         });
+    }
+
+    /// Until a session has connected once, warns that Windows is likely to
+    /// ask about network access — the prompt used to arrive unannounced,
+    /// from an unsigned binary, halfway through setting up a session.
+    fn show_network_notice(&self, ui: &mut egui::Ui) {
+        if self.network_notice_seen {
+            return;
+        }
+        let p = theme::palette_for(ui);
+        ui.add_space(theme::space::SM);
+        ui.label(
+            egui::RichText::new(
+                "The first time you connect, Windows may ask whether Screen Share can use \
+                 the network. Allow it, or connecting to your peer may fail or fall back \
+                 to a slower relay.",
+            )
+            .size(theme::size::SM)
+            .color(p.ink_2),
+        );
+    }
+
+    /// Settings and the log, in the top-right corner of every screen but
+    /// the viewer (where F10 still opens the log).
+    fn show_utility_buttons(&mut self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("utility_buttons"))
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::vec2(-theme::space::SM, theme::space::SM),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let log_label = if self.log_drawer.is_open() { "Hide log" } else { "Log" };
+                    if widgets::quiet_button(ui, log_label).on_hover_text("F10").clicked() {
+                        self.log_drawer.toggle();
+                    }
+                    if widgets::quiet_button(ui, "Settings").clicked() {
+                        self.settings_panel.open(&self.settings);
+                    }
+                });
+            });
+    }
+
+    /// Closing while fullscreen: leave fullscreen first and close on the
+    /// next frame, so the size eframe saves for next launch is the
+    /// windowed one rather than the whole screen.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let (close_requested, fullscreen) =
+            ctx.input(|i| (i.viewport().close_requested(), i.viewport().fullscreen));
+        if close_requested && fullscreen == Some(true) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.viewer.fullscreen = false;
+            self.close_when_windowed = true;
+            ctx.request_repaint();
+        } else if self.close_when_windowed && fullscreen != Some(true) {
+            self.close_when_windowed = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     /// The code itself, grouped so it survives being read across a desk,
@@ -857,6 +1050,7 @@ impl App {
                 ui.heading(format!("Joining {}", grouped_code(&self.join_code())));
                 ui.add_space(theme::space::MD);
                 widgets::progress_steps(ui, &self.progress_list());
+                self.show_network_notice(ui);
                 ui.add_space(theme::space::LG);
                 self.show_share_preview(ui);
                 ui.add_space(theme::space::LG);
@@ -1345,23 +1539,90 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// What went wrong in words, what to do about it as buttons, and the
+    /// raw error behind a Details disclosure for when the words aren't
+    /// enough.
     fn show_error(&mut self, ui: &mut egui::Ui) {
+        let mut chosen: Option<Recovery> = None;
+        let mut back = false;
+        let mut open_log = false;
+
         egui::CentralPanel::default().show(ui, |ui| {
             widgets::centered_column(ui, COLUMN_WIDTH, |ui| {
                 self.show_logo_header(ui);
-                ui.vertical_centered(|ui| {
-                    widgets::status_pill(ui, StatusKind::Negative, "Error");
-                    ui.add_space(theme::space::SM);
-                    ui.label(&self.error_message);
-                });
-                ui.add_space(theme::space::XL);
-                ui.vertical_centered(|ui| {
-                    if widgets::primary_button(ui, true, "Try again").clicked() {
-                        self.cancel_session();
+                let p = theme::palette_for(ui);
+                let Some(failure) = &self.failure else {
+                    ui.heading("Something went wrong");
+                    ui.add_space(theme::space::LG);
+                    back = widgets::primary_button(ui, true, "Back to setup").clicked();
+                    return;
+                };
+
+                widgets::status_pill(ui, StatusKind::Negative, "Session failed");
+                ui.add_space(theme::space::SM);
+                ui.heading(failure.title());
+                ui.add_space(theme::space::XS);
+                ui.colored_label(p.ink_2, failure.explanation());
+                ui.add_space(theme::space::LG);
+
+                let (first, second) = failure.recoveries();
+                // Both of these already are "back to setup", just aimed.
+                let goes_back =
+                    |r: Recovery| matches!(r, Recovery::CheckCode | Recovery::PickAnother);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, true, first.label()).clicked() {
+                        chosen = Some(first);
+                    }
+                    if let Some(second) = second
+                        && widgets::secondary_button(ui, second.label()).clicked()
+                    {
+                        chosen = Some(second);
+                    }
+                    if !goes_back(first)
+                        && !second.is_some_and(goes_back)
+                        && widgets::secondary_button(ui, "Back to setup").clicked()
+                    {
+                        back = true;
                     }
                 });
+
+                ui.add_space(theme::space::MD);
+                egui::CollapsingHeader::new("Details")
+                    .id_salt("error_details")
+                    .show(ui, |ui| {
+                        // Chains with URLs in them run long; the screen
+                        // doesn't scroll, so this part does.
+                        egui::ScrollArea::vertical()
+                            .max_height(DETAILS_MAX_HEIGHT)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&failure.details)
+                                        .monospace()
+                                        .size(theme::size::SM)
+                                        .color(p.ink_2),
+                                );
+                            });
+                        ui.add_space(theme::space::XS);
+                        ui.horizontal(|ui| {
+                            if widgets::secondary_button(ui, "Copy details").clicked() {
+                                ui.ctx().copy_text(failure.details.clone());
+                            }
+                            if widgets::secondary_button(ui, "Open log").clicked() {
+                                open_log = true;
+                            }
+                        });
+                    });
             });
         });
+
+        if open_log {
+            self.log_drawer.open();
+        }
+        if let Some(recovery) = chosen {
+            self.apply_recovery(recovery);
+        } else if back {
+            self.cancel_session();
+        }
     }
 }
 
@@ -1517,10 +1778,13 @@ impl eframe::App for App {
         self.process_events();
 
         let ctx = ui.ctx().clone();
+        self.handle_close(&ctx);
 
         if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
-            crate::console::toggle();
+            self.log_drawer.toggle();
         }
+        // Before the screen, so the drawer is the outermost bottom panel.
+        self.log_drawer.show(ui, &self.log);
 
         match self.phase {
             Phase::Setup => self.show_setup(ui),
@@ -1530,6 +1794,21 @@ impl eframe::App for App {
             Phase::Joining => self.show_joining(ui),
             Phase::Viewing => self.show_viewing(ui),
             Phase::Error => self.show_error(ui),
+        }
+
+        if self.phase != Phase::Viewing {
+            self.show_utility_buttons(&ctx);
+        }
+        let session_in_flight = matches!(
+            self.phase,
+            Phase::CreatingSession | Phase::WaitingForPeer | Phase::Joining
+        );
+        if let Some(settings) = self.settings_panel.show(&ctx, session_in_flight) {
+            self.apply_settings(settings);
+        }
+        if self.log_drawer.is_open() {
+            // New lines arrive from other threads with no repaint of their own.
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
 
         match self.phase {
@@ -1561,9 +1840,26 @@ impl eframe::App for App {
             }
         }
         if let Some(code) = &self.hosted_session_code {
-            let server = crate::signaling_server::SignalingServer::new(SERVER_URL);
+            let server = SignalingServer::new(&self.session_server_url);
             server.delete_session_blocking(code);
         }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let persisted = Persisted {
+            settings: self.settings.clone(),
+            last_role: self.last_role,
+            last_target: self.last_target.clone(),
+            network_notice_seen: self.network_notice_seen,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &persisted);
+    }
+
+    /// egui's own memory (collapsed headers, scroll offsets, and so on) is
+    /// nothing worth restoring, and restoring it could bring back style or
+    /// theme state that `App::new` has just set.
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 }
 

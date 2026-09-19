@@ -65,6 +65,18 @@ pub fn secondary_button(ui: &mut Ui, text: impl Into<String>) -> Response {
     .inner
 }
 
+/// A borderless button for utilities that should be findable on every
+/// screen without competing with it (Settings, Log). Draws its frame only
+/// on hover.
+pub fn quiet_button(ui: &mut Ui, text: impl Into<String>) -> Response {
+    let p = theme::palette_for(ui);
+    ui.add(
+        egui::Button::new(RichText::new(text.into()).color(p.ink_2))
+            .frame_when_inactive(false)
+            .corner_radius(6),
+    )
+}
+
 /// A secondary-weight button that stays visibly "on" while `selected` —
 /// for view toggles like Fit / 1:1 and Stats, where the current state
 /// matters as much as the action.
@@ -138,8 +150,9 @@ pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::In
 /// A large clickable card for a top-level choice (e.g. "Start a session" vs.
 /// "Join a session"). Unlike [`primary_button`]/[`secondary_button`], both
 /// options here carry equal visual weight — this is a fork in the journey,
-/// not a primary/secondary action pair.
-pub fn choice_card(ui: &mut Ui, title: &str, description: &str) -> Response {
+/// not a primary/secondary action pair. `last_used` marks the one picked
+/// last time, as a hint rather than a default.
+pub fn choice_card(ui: &mut Ui, title: &str, description: &str, last_used: bool) -> Response {
     let p = theme::palette_for(ui);
     let resp = egui::Frame::NONE
         .fill(p.surface)
@@ -149,11 +162,23 @@ pub fn choice_card(ui: &mut Ui, title: &str, description: &str) -> Response {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(title)
-                        .size(theme::size::LG)
-                        .family(FontFamily::Name(theme::SEMIBOLD.into())),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .size(theme::size::LG)
+                            .family(FontFamily::Name(theme::SEMIBOLD.into())),
+                    );
+                    if last_used {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new("LAST USED")
+                                    .size(theme::size::SM)
+                                    .color(p.accent)
+                                    .family(FontFamily::Name(theme::MEDIUM.into())),
+                            );
+                        });
+                    }
+                });
                 ui.add_space(theme::space::XS);
                 ui.colored_label(p.ink_2, description);
             });

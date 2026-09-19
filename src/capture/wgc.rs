@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
     frame,
@@ -14,15 +14,24 @@ use windows_capture::{
     },
 };
 
+/// How much earlier than the frame interval a frame may arrive and still be
+/// kept. WGC delivers on the display's refresh, so at 30 fps on a 60 Hz
+/// screen every other frame lands a hair either side of the interval; a
+/// strict cut-off would drop most of them and deliver 20.
+const FRAME_INTERVAL_SLACK: f64 = 0.85;
+
 struct CaptureHandler {
     tx: SyncSender<Frame>,
     paused: Arc<AtomicBool>,
     scratch: Vec<u8>,
+    min_interval: Duration,
+    last_kept: Option<Instant>,
 }
 
 struct Flags {
     tx: SyncSender<Frame>,
     paused: Arc<AtomicBool>,
+    min_interval: Duration,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -34,6 +43,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             tx: ctx.flags.tx,
             paused: ctx.flags.paused,
             scratch: Vec::new(),
+            min_interval: ctx.flags.min_interval,
+            last_kept: None,
         })
     }
 
@@ -47,6 +58,18 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         if self.paused.load(Ordering::Relaxed) {
             return Ok(());
         }
+
+        // Frame-rate cap, applied here rather than through WGC's own
+        // MinUpdateInterval, which older Windows 10 builds don't have. Also
+        // before the readback, so a dropped frame costs nothing.
+        let now = Instant::now();
+        if self
+            .last_kept
+            .is_some_and(|t| now.duration_since(t) < self.min_interval.mul_f64(FRAME_INTERVAL_SLACK))
+        {
+            return Ok(());
+        }
+        self.last_kept = Some(now);
 
         let width = frame.width();
         let height = frame.height();
@@ -89,14 +112,19 @@ impl CaptureSession {
     }
 }
 
-/// Starts capturing `target` on its own thread. While `paused` is set,
-/// frames are dropped at the source.
+/// Starts capturing `target` on its own thread, at up to `fps` frames a
+/// second. While `paused` is set, frames are dropped at the source.
 pub fn start_capture(
     target: CaptureTarget,
     frame_tx: SyncSender<Frame>,
     paused: Arc<AtomicBool>,
+    fps: u32,
 ) -> Result<CaptureSession> {
-    let flags = Flags { tx: frame_tx, paused };
+    let flags = Flags {
+        tx: frame_tx,
+        paused,
+        min_interval: Duration::from_secs_f64(1.0 / fps.max(1) as f64),
+    };
     let control = match target {
         CaptureTarget::Window(window) => CaptureHandler::start_free_threaded(Settings::new(
             window,

@@ -10,14 +10,29 @@ pub struct H264Encoder {
     height: u32,
 }
 
+/// Bits per pixel per frame the encoder is budgeted. 0.07 is what the old
+/// fixed 2 Mbps worked out to at 1280x720 and 30 fps, which looked right for
+/// desktop content; scaling from it keeps larger or faster settings looking
+/// the same rather than starving them.
+const BITS_PER_PIXEL: f64 = 0.07;
+const MIN_BITRATE: u32 = 1_000_000;
+/// Past this the data channel, not the encoder, is the bottleneck.
+const MAX_BITRATE: u32 = 10_000_000;
+
+fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
+    let bps = width as f64 * height as f64 * fps as f64 * BITS_PER_PIXEL;
+    (bps as u32).clamp(MIN_BITRATE, MAX_BITRATE)
+}
+
 impl H264Encoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
-            .max_frame_rate(openh264::encoder::FrameRate::from_hz(30.0))
+            .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps as f32))
             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate)
-            .bitrate(openh264::encoder::BitRate::from_bps(2_000_000))
-            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(60));
+            .bitrate(openh264::encoder::BitRate::from_bps(bitrate_for(width, height, fps)))
+            // A keyframe every two seconds, whatever the frame rate.
+            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2));
         let encoder =
             Encoder::with_api_config(api, config).context("Failed to create H264 encoder")?;
         Ok(Self {

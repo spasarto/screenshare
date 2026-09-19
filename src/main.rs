@@ -3,13 +3,21 @@
 mod app;
 mod capture;
 mod codec;
-mod console;
+mod failure;
+mod logging;
 mod signaling_server;
 mod transport;
 mod viewer;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, Layer as _};
+
+/// What the in-app log drawer records unless `RUST_LOG` says otherwise:
+/// this app's own debug output, everyone else's info and up.
+const DRAWER_LOG_FILTER: &str = "info,screenshare=debug";
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "screenshare", about = "Peer-to-peer screen sharing")]
@@ -48,11 +56,15 @@ fn main() -> Result<()> {
     // rustls panics on first use rather than guess (see Cargo.toml).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    // Two sinks: the console (debug builds have one; release builds are a
+    // windowed app and don't), and the buffer behind the in-app log drawer.
+    let log_buffer = logging::LogBuffer::new();
+    let env_filter = |default: &str| {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default))
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(env_filter("info")))
+        .with(logging::layer(log_buffer.clone()).with_filter(env_filter(DRAWER_LOG_FILTER)))
         .init();
 
     // Validate pin format if provided
@@ -88,14 +100,19 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Screen Share")
             .with_inner_size([960.0, 540.0])
+            // Below this the picker grid and the viewer toolbar stop fitting.
+            .with_min_inner_size([720.0, 540.0])
             .with_icon(icon),
+        // Size and position are restored from the last run (eframe's own
+        // window persistence); the app's own state is saved in `App::save`.
+        persist_window: true,
         ..Default::default()
     };
 
     eframe::run_native(
         "Screen Share",
         native_options,
-        Box::new(move |cc| Ok(Box::new(viewer::App::new(args, cc)))),
+        Box::new(move |cc| Ok(Box::new(viewer::App::new(args, log_buffer, cc)))),
     )
     .map_err(|e| anyhow::anyhow!("Viewer error: {e}"))?;
 

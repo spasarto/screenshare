@@ -1,13 +1,14 @@
 use crate::capture;
 use crate::capture::CaptureTarget;
 use crate::codec::{H264Decoder, H264Encoder};
+use crate::failure::{SessionFailure, Step};
 use crate::signaling_server::SignalingServer;
 use crate::transport::control::Control;
 use crate::transport::framing::IncomingMessage;
 use crate::transport::peer::{self, PeerConnection};
 use crate::transport::{ConnState, SessionStats, SharedConnState};
 use crate::viewer::DecodedFrame;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,8 +16,6 @@ use tokio::sync::{mpsc, watch};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
 
-const TARGET_WIDTH: u32 = 1280;
-const TARGET_HEIGHT: u32 = 720;
 const FRAME_CHANNEL_SIZE: usize = 4;
 
 /// How often each side pings the other to measure round-trip time.
@@ -38,10 +37,19 @@ pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 
 type DcHolder = Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Offerer,
     Answerer,
+}
+
+/// What a session sends: the largest frame the encoder is fed (captures are
+/// scaled down to fit, never up) and how many frames a second it takes.
+#[derive(Clone, Copy, Debug)]
+pub struct Quality {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub fps: u32,
 }
 
 /// Where a session has got to in the signaling handshake. Reported to the
@@ -102,7 +110,7 @@ pub enum SessionEvent {
     /// Offerer: session created, here's the code to share.
     SessionCode(String),
     SessionReady(SessionHandle),
-    Error(String),
+    Error(SessionFailure),
 }
 
 /// Report a stage transition, ignoring a closed channel: the GUI dropping the
@@ -118,6 +126,7 @@ fn progress(event_tx: &std::sync::mpsc::Sender<SessionEvent>, stage: Stage) {
 pub fn spawn_offerer(
     server_url: String,
     target: CaptureTarget,
+    quality: Quality,
     custom_pin: Option<String>,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -129,15 +138,14 @@ pub fn spawn_offerer(
             match run_offerer(
                 server_url,
                 target,
+                quality,
                 custom_pin.as_deref(),
                 &event_tx,
                 cancel_rx,
                 repaint,
             ) {
                 Ok(()) | Err(SessionError::Cancelled) => {}
-                Err(SessionError::Other(e)) => {
-                    let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
-                }
+                Err(SessionError::Other(e)) => fail(&event_tx, &e, Role::Offerer),
             }
         })
         .expect("Failed to spawn offerer thread");
@@ -147,6 +155,7 @@ pub fn spawn_offerer(
 pub fn spawn_answerer(
     server_url: String,
     target: CaptureTarget,
+    quality: Quality,
     session_code: String,
     event_tx: std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -158,18 +167,24 @@ pub fn spawn_answerer(
             match run_answerer(
                 server_url,
                 target,
+                quality,
                 &session_code,
                 &event_tx,
                 cancel_rx,
                 repaint,
             ) {
                 Ok(()) | Err(SessionError::Cancelled) => {}
-                Err(SessionError::Other(e)) => {
-                    let _ = event_tx.send(SessionEvent::Error(format!("{e:#}")));
-                }
+                Err(SessionError::Other(e)) => fail(&event_tx, &e, Role::Answerer),
             }
         })
         .expect("Failed to spawn answerer thread");
+}
+
+/// Logs the raw chain (the error screen shows a sentence; the log drawer is
+/// where the detail goes) and hands the GUI the classified failure.
+fn fail(event_tx: &std::sync::mpsc::Sender<SessionEvent>, error: &anyhow::Error, role: Role) {
+    tracing::error!("Session failed: {error:#}");
+    let _ = event_tx.send(SessionEvent::Error(SessionFailure::new(error, role)));
 }
 
 /// Distinguishes a user-initiated cancel from a real failure, so a cancelled
@@ -194,6 +209,7 @@ impl From<anyhow::Error> for SessionError {
 fn run_offerer(
     server_url: String,
     target: CaptureTarget,
+    quality: Quality,
     custom_pin: Option<&str>,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -220,8 +236,10 @@ fn run_offerer(
         // the signaling server. See transport::crypto for why this matters.
         let key = crate::transport::crypto::SessionKey::derive(&code);
 
-        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
-        let offer_json = peer.create_offer().await?;
+        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers)
+            .await
+            .context(Step::PeerSetup)?;
+        let offer_json = peer.create_offer().await.context(Step::PeerSetup)?;
 
         // Upload offer SDP to the signaling server
         server.upload_offer(&code, &offer_json, &key).await?;
@@ -239,7 +257,7 @@ fn run_offerer(
         // whole plumbing exists for.
         let answer_json = server.poll_answer(&code, &key, cancel_rx.clone()).await?;
         progress(event_tx, Stage::Negotiating);
-        peer.set_answer(&answer_json).await?;
+        peer.set_answer(&answer_json).await.context(Step::PeerSetup)?;
 
         // Both SDPs are exchanged and every later renegotiation happens
         // in-band, so the server-side session has done its job. Removing it
@@ -274,13 +292,14 @@ fn run_offerer(
 
     tracing::info!("Offerer signaling complete, starting media threads");
     run_connected(
-        &rt, link, target, encoded_tx, conn_state, stats, event_tx, cancel_rx, repaint,
+        &rt, link, target, quality, encoded_tx, conn_state, stats, event_tx, cancel_rx, repaint,
     )
 }
 
 fn run_answerer(
     server_url: String,
     target: CaptureTarget,
+    quality: Quality,
     session_code: &str,
     event_tx: &std::sync::mpsc::Sender<SessionEvent>,
     cancel_rx: watch::Receiver<bool>,
@@ -319,8 +338,10 @@ fn run_answerer(
             .await?;
         progress(event_tx, Stage::Negotiating);
 
-        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers).await?;
-        let answer_json = peer.accept_offer(&offer_json).await?;
+        let mut peer = PeerConnection::new(conn_state.clone(), ice_servers)
+            .await
+            .context(Step::PeerSetup)?;
+        let answer_json = peer.accept_offer(&offer_json).await.context(Step::PeerSetup)?;
 
         // Upload our answer to the signaling server
         server
@@ -354,7 +375,7 @@ fn run_answerer(
 
     tracing::info!("Answerer signaling complete, starting media threads");
     run_connected(
-        &rt, link, target, encoded_tx, conn_state, stats, event_tx, cancel_rx, repaint,
+        &rt, link, target, quality, encoded_tx, conn_state, stats, event_tx, cancel_rx, repaint,
     )
 }
 
@@ -376,6 +397,7 @@ fn run_connected(
     rt: &tokio::runtime::Runtime,
     link: Link,
     target: CaptureTarget,
+    quality: Quality,
     encoded_tx: mpsc::Sender<Vec<u8>>,
     conn_state: SharedConnState,
     stats: Arc<SessionStats>,
@@ -391,6 +413,7 @@ fn run_connected(
 
     let capture = match start_media_threads(MediaThreads {
         target,
+        quality,
         encoded_tx,
         incoming_rx: link.incoming_rx,
         signaling_tx: link.signaling_tx,
@@ -519,6 +542,7 @@ async fn close_quietly(pc: &RTCPeerConnection) {
 
 struct MediaThreads {
     target: CaptureTarget,
+    quality: Quality,
     encoded_tx: mpsc::Sender<Vec<u8>>,
     incoming_rx: mpsc::Receiver<Vec<u8>>,
     signaling_tx: mpsc::Sender<Vec<u8>>,
@@ -538,6 +562,7 @@ struct MediaThreads {
 fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSession> {
     let MediaThreads {
         target,
+        quality,
         encoded_tx,
         incoming_rx,
         signaling_tx,
@@ -565,8 +590,8 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
                     &frame.data,
                     frame.width,
                     frame.height,
-                    TARGET_WIDTH,
-                    TARGET_HEIGHT,
+                    quality.max_width,
+                    quality.max_height,
                 );
 
                 if encoder.is_none()
@@ -575,7 +600,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
                         .is_some_and(|e| e.width() != w || e.height() != h)
                 {
                     tracing::info!("Creating encoder for {w}x{h}");
-                    match H264Encoder::new(w, h) {
+                    match H264Encoder::new(w, h, quality.fps) {
                         Ok(e) => {
                             encoder = Some(e);
                             encoder_stats.set_local_size(w, h);
@@ -681,7 +706,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
 
     // Last, so failing to spawn either thread above can't leave a capture
     // running with nothing to stop it.
-    capture::wgc::start_capture(target, capture_tx, paused)
+    capture::wgc::start_capture(target, capture_tx, paused, quality.fps).context(Step::Capture)
 }
 
 /// Shrinks an encoder-input frame (BGRA) to the RGBA still the viewer shows

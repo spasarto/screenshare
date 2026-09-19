@@ -7,7 +7,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 webrtc = "0.17"
 openh264 = "0.9"
-eframe = "0.36"
+eframe = { version = "0.36", features = ["persistence"] }
 egui = "0.36"
 windows-capture = "2.0"
 windows = { version = "0.62", features = [
