@@ -18,6 +18,10 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
 
 const FRAME_CHANNEL_SIZE: usize = 4;
+/// Captured frames waiting for the encoder. One: when the encoder is behind,
+/// a deeper queue only adds latency (each queued frame is a full encode
+/// older than the screen) without raising the frame rate.
+const CAPTURE_QUEUE_SIZE: usize = 1;
 
 /// How often each side pings the other to measure round-trip time.
 const PING_INTERVAL: Duration = Duration::from_secs(2);
@@ -579,7 +583,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
     diag::start_reporter();
 
     let (capture_tx, capture_rx) =
-        std::sync::mpsc::sync_channel::<capture::Frame>(FRAME_CHANNEL_SIZE);
+        std::sync::mpsc::sync_channel::<capture::Frame>(CAPTURE_QUEUE_SIZE);
 
     let encoder_stats = stats.clone();
     std::thread::Builder::new()
@@ -748,8 +752,9 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
 /// Shrinks an encoder-input frame (BGRA) to the RGBA still the viewer shows
 /// in its sharing indicator.
 fn preview_frame(bgra: &[u8], width: u32, height: u32) -> DecodedFrame {
-    let (w, h, mut pixels) =
+    let (w, h, pixels) =
         capture::scale_bgra(bgra, width, height, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT);
+    let mut pixels = pixels.into_owned();
     for px in pixels.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
         // Captured windows can carry meaningless alpha; the still is opaque.

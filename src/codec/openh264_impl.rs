@@ -1,14 +1,23 @@
 use anyhow::{Context, Result};
 use openh264::OpenH264API;
 use openh264::decoder::Decoder;
-use openh264::encoder::{Encoder, EncoderConfig};
+use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
+use std::time::{Duration, Instant};
 
 pub struct H264Encoder {
     encoder: Encoder,
     width: u32,
     height: u32,
+    /// When the last keyframe went out; `None` until the first one.
+    last_keyframe: Option<Instant>,
 }
+
+/// How long a viewer that joins or loses data mid-stream waits, at most, for
+/// a picture it can decode from. Timed rather than counted in frames: the
+/// capture only delivers frames when the screen changes, so a frame count
+/// meant for 60 fps could stretch to tens of seconds on a quiet screen.
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Bits per pixel per frame the encoder is budgeted. 0.07 is what the old
 /// fixed 2 Mbps worked out to at 1280x720 and 30 fps, which looked right for
@@ -30,15 +39,14 @@ impl H264Encoder {
         let config = EncoderConfig::new()
             .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps as f32))
             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate)
-            .bitrate(openh264::encoder::BitRate::from_bps(bitrate_for(width, height, fps)))
-            // A keyframe every two seconds, whatever the frame rate.
-            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2));
+            .bitrate(openh264::encoder::BitRate::from_bps(bitrate_for(width, height, fps)));
         let encoder =
             Encoder::with_api_config(api, config).context("Failed to create H264 encoder")?;
         Ok(Self {
             encoder,
             width,
             height,
+            last_keyframe: None,
         })
     }
 
@@ -48,7 +56,16 @@ impl H264Encoder {
         let h = self.height as usize;
         let bgra_src = BgraSliceU8::new(bgra_data, (w, h));
         let yuv = YUVBuffer::from_rgb_source(bgra_src);
+        if self
+            .last_keyframe
+            .is_some_and(|t| t.elapsed() >= KEYFRAME_INTERVAL)
+        {
+            self.encoder.force_intra_frame();
+        }
         let bitstream = self.encoder.encode(&yuv).context("H264 encode failed")?;
+        if matches!(bitstream.frame_type(), FrameType::IDR) {
+            self.last_keyframe = Some(Instant::now());
+        }
         Ok(bitstream.to_vec())
     }
 
