@@ -1,6 +1,8 @@
 use crate::app::Role;
+use crate::diag;
 use crate::transport::signaling::{self, SignalingBlob};
-use crate::transport::{ConnState, SharedConnState};
+use crate::transport::control::Control;
+use crate::transport::{ConnState, SessionStats, SharedConnState};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +20,7 @@ use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::stats::StatsReportType;
 
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const BACKOFF_BASE_MS: u64 = 1000;
 const BACKOFF_CAP_MS: u64 = 30000;
 
@@ -186,7 +188,13 @@ impl PeerConnection {
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let tx = tx.clone();
             Box::pin(async move {
+                diag::RCV_MSGS.inc();
+                diag::RCV_BYTES.add(msg.data.len() as u64);
+                // Time spent waiting here is time the SCTP stack can't
+                // deliver the next message: the decoder isn't keeping up.
+                let wait_start = std::time::Instant::now();
                 let _ = tx.send(msg.data.to_vec()).await;
+                diag::RCV_QUEUE_WAIT_US.add_time(wait_start.elapsed());
             })
         }));
     }
@@ -325,6 +333,7 @@ pub fn spawn_sender(
     dc_holder: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     conn_state: SharedConnState,
+    stats: Arc<SessionStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Wait for the data channel to become available before sending.
@@ -341,8 +350,11 @@ pub fn spawn_sender(
         tracing::info!("Data channel ready, starting to send frames");
 
         while let Some(data) = outgoing_rx.recv().await {
+            diag::SND_IN.inc();
+
             // Drop frames while reconnecting
             if conn_state.get() != ConnState::Connected {
+                diag::SND_DROP_STATE.inc();
                 continue;
             }
 
@@ -354,20 +366,43 @@ pub fn spawn_sender(
                 let dc_guard = dc_holder.lock().await;
                 dc_guard.clone()
             };
-            let Some(dc) = dc else { continue };
+            let Some(dc) = dc else {
+                diag::SND_DROP_NO_DC.inc();
+                continue;
+            };
 
             // The link can't keep up with the encoder; drop this frame
             // rather than let the SCTP send queue grow without bound.
-            if dc.buffered_amount().await > MAX_BUFFERED_AMOUNT {
+            let buffered = dc.buffered_amount().await;
+            diag::SND_MAX_BUFFERED.max(buffered as u64);
+            if buffered > MAX_BUFFERED_AMOUNT {
+                diag::SND_DROP_BUFFERED.inc();
+                tracing::debug!(
+                    "Dropping {} KB frame: {} KB already buffered",
+                    data.len() / 1024,
+                    buffered / 1024
+                );
                 continue;
             }
 
+            let send_start = std::time::Instant::now();
+
             let chunks = super::framing::encode_chunked(&data);
+            let mut sent = true;
             for chunk in chunks {
                 if let Err(e) = dc.send(&bytes::Bytes::from(chunk)).await {
+                    diag::SND_ERR.inc();
                     tracing::warn!("Failed to send on data channel: {e}");
+                    sent = false;
                     break;
                 }
+            }
+            let send_time = send_start.elapsed();
+            diag::SND_SEND_US.add_time(send_time);
+            diag::SND_SEND_MAX_US.max_time(send_time);
+            if sent {
+                diag::SND_SENT.inc();
+                stats.add_sent(data.len());
             }
         }
     })
@@ -433,6 +468,34 @@ async fn send_raw(
     Ok(())
 }
 
+/// Send a session control message to the peer. Best effort by nature: a
+/// control message that can't be delivered (no channel yet, link down) has
+/// nothing useful to retry against.
+pub async fn send_control(
+    dc_holder: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    control: Control,
+) -> Result<()> {
+    send_raw(dc_holder, control.encode()).await
+}
+
+/// Waits (up to `timeout`) for everything queued on the data channel to be
+/// handed to the network. `send` only queues, so closing the peer connection
+/// straight after one otherwise discards the message.
+pub async fn flush(
+    dc_holder: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    timeout: Duration,
+) {
+    let Some(dc) = dc_holder.lock().await.clone() else {
+        return;
+    };
+    let _ = tokio::time::timeout(timeout, async {
+        while dc.buffered_amount().await > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
 /// Spawn the reconnection monitor task. This task waits for disconnection notifications
 /// and performs ICE restart negotiation over the existing data channel.
 pub fn spawn_reconnect_monitor(
@@ -449,6 +512,11 @@ pub fn spawn_reconnect_monitor(
         loop {
             // Wait for a disconnection signal
             disconnect_notify.notified().await;
+            // Closed on purpose (either side hung up): nothing to restart.
+            if conn_state.get() == ConnState::Failed {
+                tracing::info!("Reconnect monitor: connection closed, stopping");
+                break;
+            }
             tracing::info!("Reconnect monitor: disconnection detected, starting ICE restart");
 
             attempt += 1;
@@ -462,6 +530,7 @@ pub fn spawn_reconnect_monitor(
                 }
                 break;
             }
+            conn_state.set_reconnect_attempt(attempt);
 
             // Exponential backoff
             let delay = BACKOFF_BASE_MS * 2u64.pow(attempt - 1);

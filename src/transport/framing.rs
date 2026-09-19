@@ -9,6 +9,7 @@
 /// - Chunked start:     [0x01][4-byte BE total_len]
 /// - Chunked data:      [0x02][chunk_payload]
 /// - Signaling message: [0x03][payload]  (JSON-serialized SignalingBlob)
+/// - Control message:   [0x04][kind][payload]  (see `transport::control`)
 const MAX_CHUNK_PAYLOAD: usize = 15000; // Well under 16KB SCTP limit
 
 /// Upper bound on a reassembled message's declared length. Guards the
@@ -18,6 +19,7 @@ const MAX_CHUNK_PAYLOAD: usize = 15000; // Well under 16KB SCTP limit
 const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB, comfortably above any keyframe we produce
 
 pub const MSG_SIGNALING: u8 = 0x03;
+pub const MSG_CONTROL: u8 = 0x04;
 
 /// Encode a signaling payload (JSON bytes) into a framed message.
 pub fn encode_signaling(json: &[u8]) -> Vec<u8> {
@@ -33,6 +35,8 @@ pub enum IncomingMessage {
     VideoData(Vec<u8>),
     /// Signaling message (raw JSON bytes)
     Signaling(Vec<u8>),
+    /// Session control message (see `transport::control`)
+    Control(super::control::Control),
     /// More chunks needed, or invalid
     Pending,
 }
@@ -155,6 +159,14 @@ impl Reassembler {
         }
         if msg[0] == MSG_SIGNALING {
             return IncomingMessage::Signaling(msg[1..].to_vec());
+        }
+        if msg[0] == MSG_CONTROL {
+            // Unknown kinds come from a newer peer; dropping them is the
+            // compatibility contract, not an error.
+            return match super::control::Control::decode(&msg[1..]) {
+                Some(control) => IncomingMessage::Control(control),
+                None => IncomingMessage::Pending,
+            };
         }
         match self.feed(msg) {
             Some(data) => IncomingMessage::VideoData(data),
@@ -283,8 +295,8 @@ mod tests {
             match reassembler.feed_classified(frame) {
                 IncomingMessage::VideoData(d) => video_result = Some(d),
                 IncomingMessage::Pending => {}
-                IncomingMessage::Signaling(_) => {
-                    panic!("video frame {i} misclassified as signaling")
+                IncomingMessage::Signaling(_) | IncomingMessage::Control(_) => {
+                    panic!("video frame {i} misclassified")
                 }
             }
         }

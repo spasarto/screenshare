@@ -208,6 +208,112 @@ export class Session implements DurableObject {
   }
 }
 
+/**
+ * The landing page behind the share link the host copies (and the QR it
+ * shows): `/j/:code`. Deliberately static — it neither creates nor looks up
+ * the session, so opening a link costs the recipient's IP nothing from the
+ * rate-limit budget and tells a stranger with a guessed code nothing about
+ * whether it exists. All it does is carry the code somewhere it can be
+ * copied on whatever device the peer opened it on.
+ */
+function joinPage(code: string): Response {
+  const grouped = `${code.slice(0, CODE_DIGITS)} · ${code.slice(CODE_DIGITS)}`;
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Join a screen share</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #F2F5F5; --surface: #FFFFFF; --ink: #101719; --ink-2: #3D4A4D;
+    --ink-3: #6B7A7E; --hairline: #D6DEDE; --accent: #16707F; --on-accent: #FFFFFF;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0C1214; --surface: #131B1E; --ink: #E4EBEC; --ink-2: #AFBEC1;
+      --ink-3: #7D8E92; --hairline: #263236; --accent: #5BC6D6; --on-accent: #0C1214;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 24px; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main {
+    width: 100%; max-width: 27rem; background: var(--surface);
+    border: 1px solid var(--hairline); border-radius: 12px; padding: 28px 24px;
+  }
+  h1 { margin: 0 0 4px; font-size: 1.25rem; letter-spacing: -.01em; }
+  p { margin: 0; color: var(--ink-2); }
+  .label {
+    margin: 24px 0 6px; font-size: .6875rem; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .code {
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: clamp(1.75rem, 9vw, 2.5rem); font-weight: 600; letter-spacing: .02em;
+    word-break: break-word;
+  }
+  button {
+    margin-top: 16px; width: 100%; padding: 12px 16px; font: inherit; font-weight: 600;
+    color: var(--on-accent); background: var(--accent); border: 0; border-radius: 8px;
+    cursor: pointer;
+  }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  ol { margin: 20px 0 0; padding-left: 1.25em; color: var(--ink-2); }
+  li { margin-bottom: 4px; }
+  .note { margin-top: 20px; font-size: .875rem; color: var(--ink-3); }
+</style>
+</head>
+<body>
+<main>
+  <h1>You've been invited to a screen share</h1>
+  <p>Both sides share a window, so you'll pick something to share too.</p>
+
+  <div class="label">Session code</div>
+  <div class="code" id="code">${grouped}</div>
+  <button id="copy" data-code="${code}">Copy code</button>
+
+  <ol>
+    <li>Open Screen Share on the computer you want to share from.</li>
+    <li>Choose <strong>Join a session</strong>.</li>
+    <li>Paste the code, pick a window, and press Start.</li>
+  </ol>
+
+  <p class="note">Codes are single-use and expire a few minutes after the host creates them. If this one has expired, ask for a new link.</p>
+</main>
+<script>
+  const button = document.getElementById("copy");
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(button.dataset.code);
+      button.textContent = "Copied";
+    } catch {
+      // Clipboard access can be refused (insecure context, permissions);
+      // selecting the code is the fallback that always works.
+      getSelection().selectAllChildren(document.getElementById("code"));
+      button.textContent = "Copy it from above";
+    }
+    setTimeout(() => { button.textContent = "Copy code"; }, 2000);
+  });
+</script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      // The page is the same for a given code, but a session is short-lived
+      // and single-use — no reason for an intermediary to hold on to it.
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -215,6 +321,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // CORS preflight
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  // GET /j/:code — the human-facing share link (and what the QR encodes)
+  const join = path.match(/^\/j\/([0-9]{6}[a-z]{4})$/);
+  if (join && request.method === "GET") {
+    return joinPage(join[1]);
   }
 
   // POST /api/session — create a new session
