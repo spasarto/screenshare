@@ -19,6 +19,17 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
+    # Hardware video encoding (docs/hardware-encoding-plan.md).
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_Variant",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,7 +1,7 @@
 # Hardware video encoding plan
 
 Date: 2026-09-18
-Status: **Draft.** Not started.
+Status: **Draft.** Phase 0 done (2026-09-19). Phases 1+ not started.
 
 ## Why
 
@@ -76,21 +76,37 @@ CPU scale and colour-conversion steps disappear.
 
 Each phase ships on its own and leaves the app working.
 
-### Phase 0: prerequisites and measurements (S)
+### Phase 0: prerequisites and measurements (S) — done
 
-- Add the `windows` features we need: `Win32_Media_MediaFoundation`,
-  `Win32_Graphics_Direct3D`, `Win32_Graphics_Direct3D11`, `Win32_Graphics_Dxgi`,
+- Added the `windows` features we need to `Cargo.toml`:
+  `Win32_Media_MediaFoundation`, `Win32_Graphics_Direct3D`,
+  `Win32_Graphics_Direct3D11`, `Win32_Graphics_Dxgi`,
   `Win32_Graphics_Dxgi_Common`, `Win32_System_WinRT_Direct3D11`,
   `Win32_System_WinRT_Graphics_Capture`, `Graphics_Capture`,
   `Graphics_DirectX_Direct3D11`, `Win32_System_Variant` (ICodecAPI values).
-- **Data channel throughput check.** Nothing has pushed the webrtc-rs SCTP
-  channel past ~3 Mbit/s yet. A hardware encoder at 1440p60 will want
-  8–15 Mbit/s. Add a debug-only mode that feeds the existing sender
-  synthetic frames of a set size and rate, then read `send avg`,
-  `drop_buffered` and `max buffered` from the diag log. If it can't keep
-  up, that's a separate problem to fix first (see
-  `docs/webrtc-upgrade-investigation.md`), because a faster encoder
-  would just move the bottleneck.
+  Confirmed the crate resolves and the app still builds and tests clean.
+- **Data channel throughput check.** Added `src/synthetic_load.rs`, a
+  debug-only headless mode (`--synthetic-kb`, `--synthetic-fps`,
+  `--synthetic-secs`, alongside the existing `--server`/`--client`/`--pin`)
+  that runs the real signaling handshake and peer connection, then feeds
+  the existing `peer::spawn_sender` fixed-size frames at a fixed rate
+  instead of capturing and encoding.
+  - Two local instances, real signaling server, loopback ICE
+    (`local=host remote=host relay=false`).
+  - At **17 KB @ 60 fps (~8.2 Mbit/s)**: `drop_buffered 0`, max buffered
+    ~34 KB. Clean.
+  - At **31 KB @ 60 fps (~15 Mbit/s)**, the top of the range a hardware
+    encoder would want: `drop_buffered` ~8 of every 60 frames (~13%),
+    max buffered pinned near the 256 KB cap
+    (`MAX_BUFFERED_AMOUNT` in `transport/peer.rs`).
+  - At 40 KB @ 60 fps (~19 Mbit/s) drops rise further (~30%).
+  - **Conclusion: the data channel can't sustain the top of the target
+    range yet.** It's fine low in the range but degrades before 15 Mbit/s
+    even on loopback with no encode cost in the loop, confirming the
+    concern above — a faster encoder alone would just move the
+    bottleneck to the transport. This is a separate problem to fix first
+    (see `docs/webrtc-upgrade-investigation.md`); phases 1–3 should not
+    raise `MAX_BITRATE` until it's addressed.
 
 ### Phase 1: our own WGC capture on a video-capable device (M)
 

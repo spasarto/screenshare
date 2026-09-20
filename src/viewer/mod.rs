@@ -1,6 +1,6 @@
 mod log_drawer;
 mod picker_grid;
-mod settings;
+pub mod settings;
 mod stats;
 mod theme;
 mod widgets;
