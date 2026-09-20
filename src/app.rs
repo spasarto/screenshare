@@ -564,7 +564,7 @@ struct MediaThreads {
 /// encoder. The returned capture is the one thing that needs stopping by
 /// hand: the encoder exits when it does, and the decoder when the peer
 /// connection's runtime goes away.
-fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSession> {
+fn start_media_threads(threads: MediaThreads) -> Result<capture::session::CaptureSession> {
     let MediaThreads {
         target,
         quality,
@@ -750,7 +750,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::wgc::CaptureSes
 
     // Last, so failing to spawn either thread above can't leave a capture
     // running with nothing to stop it.
-    capture::wgc::start_capture(target, capture_tx, paused, quality.fps).context(Step::Capture)
+    capture::session::start_capture(target, capture_tx, paused, quality.fps).context(Step::Capture)
 }
 
 /// Shrinks an encoder-input frame (BGRA) to the RGBA still the viewer shows

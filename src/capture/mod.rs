@@ -1,6 +1,6 @@
 pub mod picker;
+pub mod session;
 pub mod thumbnail;
-pub mod wgc;
 
 use std::borrow::Cow;
 use std::time::Instant;

@@ -1,7 +1,7 @@
 # Hardware video encoding plan
 
 Date: 2026-09-18
-Status: **Draft.** Phase 0 done (2026-09-19). Phases 1+ not started.
+Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phases 2+ not started.
 
 ## Why
 
@@ -108,7 +108,7 @@ Each phase ships on its own and leaves the app working.
     (see `docs/webrtc-upgrade-investigation.md`); phases 1–3 should not
     raise `MAX_BITRATE` until it's addressed.
 
-### Phase 1: our own WGC capture on a video-capable device (M)
+### Phase 1: our own WGC capture on a video-capable device (M) — done
 
 `windows-capture` creates its D3D11 device with `D3D11_CREATE_DEVICE_BGRA_SUPPORT`
 only. Media Foundation's `IMFDXGIDeviceManager` and `ID3D11VideoDevice` expect
@@ -130,6 +130,17 @@ own device. So:
   moves.
 - For this phase, keep the CPU readback so behaviour is identical. It's pure
   plumbing, to be verified against the diag numbers.
+
+Landed as `src/capture/session.rs`, replacing `src/capture/wgc.rs`. Cursor-on
+and border-off are applied best-effort (logged at debug if unsupported); the
+slack-based rate cap in the frame handler stays regardless of whether
+`SetMinUpdateInterval` succeeds, rather than being an either/or fallback.
+`Recreate` on the WinRT `IDirect3DDevice` needed the same `SendDirectX`-style
+`Send` opt-in `windows-capture` uses internally, plus forcing capture of the
+whole wrapper (Rust 2021 disjoint closure capture otherwise reaches past it
+and grabs the non-`Send` field directly). Verified with a live capture test
+against the primary monitor (`cargo test --bin screenshare
+capture::session::tests -- --ignored`) and a manual run of the app.
 
 ### Phase 2: GPU scale and colour conversion (M)
 
