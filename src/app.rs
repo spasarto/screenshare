@@ -594,26 +594,14 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
 
             while let Ok(frame) = capture_rx.recv() {
                 diag::ENC_IN.inc();
-                let scale_start = Instant::now();
-                let (w, h, scaled) = capture::scale_bgra(
-                    &frame.data,
-                    frame.width,
-                    frame.height,
-                    quality.max_width,
-                    quality.max_height,
-                );
-                diag::ENC_SCALE_US.add_time(scale_start.elapsed());
+                let (w, h) = (frame.width, frame.height);
 
                 if encoder.is_none()
                     || encoder
                         .as_ref()
                         .is_some_and(|e| e.width() != w || e.height() != h)
                 {
-                    tracing::info!(
-                        "Creating encoder for {w}x{h} (captured {}x{})",
-                        frame.width,
-                        frame.height
-                    );
+                    tracing::info!("Creating encoder for {w}x{h}");
                     match H264Encoder::new(w, h, quality.fps) {
                         Ok(e) => {
                             encoder = Some(e);
@@ -628,13 +616,13 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
 
                 if last_preview.is_none_or(|t| t.elapsed() >= PREVIEW_INTERVAL) {
                     last_preview = Some(Instant::now());
-                    *outgoing_preview.lock().unwrap() = Some(preview_frame(&scaled, w, h));
+                    *outgoing_preview.lock().unwrap() = Some(preview_frame(&frame.y, &frame.uv, w, h));
                 }
 
                 let enc = encoder.as_mut().unwrap();
 
                 let encode_start = Instant::now();
-                let result = enc.encode(&scaled);
+                let result = enc.encode(&frame.y, &frame.uv);
                 let encode_time = encode_start.elapsed();
                 diag::ENC_ENCODE_US.add_time(encode_time);
                 diag::ENC_ENCODE_MAX_US.max_time(encode_time);
@@ -750,23 +738,13 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
 
     // Last, so failing to spawn either thread above can't leave a capture
     // running with nothing to stop it.
-    capture::session::start_capture(target, capture_tx, paused, quality.fps).context(Step::Capture)
+    capture::session::start_capture(target, capture_tx, paused, quality.fps, quality.max_width, quality.max_height)
+        .context(Step::Capture)
 }
 
-/// Shrinks an encoder-input frame (BGRA) to the RGBA still the viewer shows
+/// Shrinks an encoder-input frame (NV12) to the RGBA still the viewer shows
 /// in its sharing indicator.
-fn preview_frame(bgra: &[u8], width: u32, height: u32) -> DecodedFrame {
-    let (w, h, pixels) =
-        capture::scale_bgra(bgra, width, height, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT);
-    let mut pixels = pixels.into_owned();
-    for px in pixels.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-        // Captured windows can carry meaningless alpha; the still is opaque.
-        px[3] = 255;
-    }
-    DecodedFrame {
-        width: w,
-        height: h,
-        rgba: pixels,
-    }
+fn preview_frame(y: &[u8], uv: &[u8], width: u32, height: u32) -> DecodedFrame {
+    let (w, h, rgba) = capture::nv12_preview_rgba(y, uv, width, height, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT);
+    DecodedFrame { width: w, height: h, rgba }
 }

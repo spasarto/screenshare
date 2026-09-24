@@ -1,7 +1,7 @@
 # Hardware video encoding plan
 
 Date: 2026-09-18
-Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phases 2+ not started.
+Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phases 3+ not started.
 
 ## Why
 
@@ -142,7 +142,7 @@ and grabs the non-`Send` field directly). Verified with a live capture test
 against the primary monitor (`cargo test --bin screenshare
 capture::session::tests -- --ignored`) and a manual run of the app.
 
-### Phase 2: GPU scale and colour conversion (M)
+### Phase 2: GPU scale and colour conversion (M) — done
 
 - `ID3D11VideoDevice` / `ID3D11VideoContext` → one `ID3D11VideoProcessor`
   per (input size, output size) pair. `VideoProcessorBlt` BGRA → NV12 with
@@ -161,6 +161,29 @@ capture::session::tests -- --ignored`) and a manual run of the app.
   session path once nothing uses it.
 - Expected result, before any hardware encoding: readback ~3–5 ms,
   `scale avg` 0, OpenH264 encode somewhat faster (no RGB conversion).
+
+Landed as `src/capture/video_processor.rs`. The capture thread creates a
+`VideoProcessor` per (input size, output size) pair (recreated on window
+resize) and, per frame, `VideoProcessorBlt`s the captured BGRA texture into
+the next of 3 ring-buffered NV12 textures, then reads that back to two CPU
+planes (`Y`, interleaved `UV`) — the only readback left, and far smaller than
+the old full-size BGRA one. `capture::scale_bgra` is gone; the aspect-fit
+sizing logic moved to `capture::aspect_fit_16`, rounding up to multiples of
+16 instead of 2 (the crop via `MF_MT_MINIMUM_DISPLAY_APERTURE` is deferred to
+phase 3 — for now the fallback stretches into the padding rather than
+cropping it, since nothing consumes the aperture metadata yet).
+`codec::H264Encoder::encode` now takes the Y/UV planes directly; a small
+`Nv12Yuv` adapter de-interleaves chroma into OpenH264's `YUVSource` shape (one
+cheap pass, no BGRA → I420 conversion). The outgoing "you are sharing"
+preview thumbnail is generated straight from NV12 (`capture::nv12_preview_rgba`)
+since the encoder-input frame is no longer BGRA. `ENC_SCALE_US` stays in
+`diag` (now always 0, since the scale happens upstream on the GPU); a new
+`CAP_GPU_US`/`CAP_GPU_MAX_US` pair tracks the Blt itself, logged alongside
+readback in the capture pipeline line. Verified with a live capture test that captures the primary monitor, runs it
+through the real video processor, and feeds the resulting NV12 planes to a
+real `H264Encoder` (`cargo test --bin screenshare capture::session::tests --
+--ignored`). Not yet re-run: the two-local-instances stress test from phase 0
+to confirm the expected latency drop end to end.
 
 ### Phase 3: Media Foundation hardware encoder (L)
 

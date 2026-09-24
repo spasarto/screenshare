@@ -52,6 +52,10 @@ pub static CAP_SKIP_PAUSED: Counter = Counter::new();
 pub static CAP_SKIP_RATE: Counter = Counter::new();
 pub static CAP_KEPT: Counter = Counter::new();
 pub static CAP_DROP_FULL: Counter = Counter::new();
+/// Time spent in the GPU video processor's scale + BGRA→NV12 Blt (phase 2 of
+/// docs/hardware-encoding-plan.md), not counting the CPU readback below.
+pub static CAP_GPU_US: Counter = Counter::new();
+pub static CAP_GPU_MAX_US: Counter = Counter::new();
 pub static CAP_READBACK_US: Counter = Counter::new();
 pub static CAP_READBACK_MAX_US: Counter = Counter::new();
 
@@ -130,6 +134,8 @@ fn reporter() {
         let cap_rate = CAP_SKIP_RATE.take();
         let cap_kept = CAP_KEPT.take();
         let cap_full = CAP_DROP_FULL.take();
+        let cap_gpu = CAP_GPU_US.take();
+        let cap_gpu_max = CAP_GPU_MAX_US.take();
         let cap_rb = CAP_READBACK_US.take();
         let cap_rb_max = CAP_READBACK_MAX_US.take();
 
@@ -179,7 +185,9 @@ fn reporter() {
         tracing::info!(
             "pipeline {secs:.2}s | capture: arrived {cap_arrived}, kept {cap_kept}, \
              skip_rate {cap_rate}, skip_paused {cap_paused}, drop_queue_full {cap_full}, \
-             readback avg {:.1}ms max {:.1}ms",
+             gpu scale avg {:.1}ms max {:.1}ms, readback avg {:.1}ms max {:.1}ms",
+            avg_ms(cap_gpu, cap_kept + cap_full),
+            ms(cap_gpu_max),
             avg_ms(cap_rb, cap_kept + cap_full),
             ms(cap_rb_max),
         );

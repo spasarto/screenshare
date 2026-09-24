@@ -2,8 +2,55 @@ use anyhow::{Context, Result};
 use openh264::OpenH264API;
 use openh264::decoder::Decoder;
 use openh264::encoder::{Complexity, Encoder, EncoderConfig, FrameType, UsageType};
-use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::YUVSource;
 use std::time::{Duration, Instant};
+
+/// Adapts NV12 planes (as produced by the GPU video processor, phase 2 of
+/// `docs/hardware-encoding-plan.md`) to the encoder's planar `YUVSource`.
+/// The Y plane is used as-is; U/V are de-interleaved once here, which is far
+/// cheaper than the BGRA→I420 conversion it replaces.
+struct Nv12Yuv<'a> {
+    width: usize,
+    height: usize,
+    y: &'a [u8],
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+impl<'a> Nv12Yuv<'a> {
+    fn new(y: &'a [u8], uv: &[u8], width: usize, height: usize) -> Self {
+        let chroma_len = (width / 2) * (height / 2);
+        let mut u = vec![0u8; chroma_len];
+        let mut v = vec![0u8; chroma_len];
+        for i in 0..chroma_len {
+            u[i] = uv[i * 2];
+            v[i] = uv[i * 2 + 1];
+        }
+        Self { width, height, y, u, v }
+    }
+}
+
+impl YUVSource for Nv12Yuv<'_> {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+
+    fn y(&self) -> &[u8] {
+        self.y
+    }
+
+    fn u(&self) -> &[u8] {
+        &self.u
+    }
+
+    fn v(&self) -> &[u8] {
+        &self.v
+    }
+}
 
 pub struct H264Encoder {
     encoder: Encoder,
@@ -73,12 +120,9 @@ impl H264Encoder {
         })
     }
 
-    /// Encode a BGRA frame into H264 NAL units.
-    pub fn encode(&mut self, bgra_data: &[u8]) -> Result<Vec<u8>> {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let bgra_src = BgraSliceU8::new(bgra_data, (w, h));
-        let yuv = YUVBuffer::from_rgb_source(bgra_src);
+    /// Encode an NV12 frame (Y plane, interleaved UV plane) into H264 NAL units.
+    pub fn encode(&mut self, y: &[u8], uv: &[u8]) -> Result<Vec<u8>> {
+        let yuv = Nv12Yuv::new(y, uv, self.width as usize, self.height as usize);
         if self
             .last_keyframe
             .is_some_and(|t| t.elapsed() >= KEYFRAME_INTERVAL)

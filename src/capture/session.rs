@@ -7,10 +7,12 @@
 //! same device, so this module builds the capture pipeline directly on top
 //! of the `windows` crate instead.
 //!
-//! This phase keeps the CPU readback identical to the old `windows-capture`
-//! path (same per-frame cost, same [`Frame`] shape) so it's pure plumbing:
-//! everything from GPU scaling onward still happens on the encoder thread.
+//! Each captured BGRA frame is scaled and colour-converted to NV12 by
+//! [`super::video_processor::VideoProcessor`] before it ever leaves this
+//! thread (phase 2 of `docs/hardware-encoding-plan.md`), so only a small
+//! NV12 surface needs a CPU readback, not the full-size BGRA capture.
 
+use super::video_processor::{self, VideoProcessor};
 use super::{CaptureTarget, Frame};
 use crate::diag;
 use anyhow::{Context as _, Result};
@@ -33,12 +35,10 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
     ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Com::{CO_MTA_USAGE_COOKIE, CoDecrementMTAUsage, CoIncrementMTAUsage};
@@ -76,12 +76,17 @@ impl CaptureSession {
 }
 
 /// Starts capturing `target` on its own thread, at up to `fps` frames a
-/// second. While `paused` is set, frames are dropped at the source.
+/// second. While `paused` is set, frames are dropped at the source. Frames
+/// are scaled and colour-converted to NV12 on the GPU to fit within
+/// `max_width`x`max_height` before being handed to `frame_tx` (see
+/// `super::video_processor`).
 pub fn start_capture(
     target: CaptureTarget,
     frame_tx: SyncSender<Frame>,
     paused: Arc<AtomicBool>,
     fps: u32,
+    max_width: u32,
+    max_height: u32,
 ) -> Result<CaptureSession> {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
@@ -89,7 +94,19 @@ pub fn start_capture(
 
     let thread = std::thread::Builder::new()
         .name("capture".into())
-        .spawn(move || run_capture_thread(target, frame_tx, paused, min_interval, stop_rx, ready_tx))
+        .spawn(move || {
+            run_capture_thread(
+                target,
+                frame_tx,
+                paused,
+                fps,
+                max_width,
+                max_height,
+                min_interval,
+                stop_rx,
+                ready_tx,
+            )
+        })
         .context("Failed to spawn capture thread")?;
 
     match ready_rx.recv() {
@@ -118,15 +135,19 @@ struct CaptureHandles {
     _winrt: WinRtGuard,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_capture_thread(
     target: CaptureTarget,
     tx: SyncSender<Frame>,
     paused: Arc<AtomicBool>,
+    fps: u32,
+    max_width: u32,
+    max_height: u32,
     min_interval: Duration,
     stop_rx: Receiver<()>,
     ready_tx: Sender<Result<()>>,
 ) {
-    let handles = match setup_capture(target, tx, paused, min_interval) {
+    let handles = match setup_capture(target, tx, paused, fps, max_width, max_height, min_interval) {
         Ok(handles) => handles,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -147,10 +168,14 @@ fn run_capture_thread(
     let _ = handles.frame_pool.Close();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_capture(
     target: CaptureTarget,
     tx: SyncSender<Frame>,
     paused: Arc<AtomicBool>,
+    fps: u32,
+    max_width: u32,
+    max_height: u32,
     min_interval: Duration,
 ) -> Result<CaptureHandles> {
     let _winrt = WinRtGuard::new().context("Failed to initialize WinRT")?;
@@ -180,6 +205,7 @@ fn setup_capture(
     let halt = Arc::new(AtomicBool::new(false));
     let last_size = (AtomicI32::new(size.Width), AtomicI32::new(size.Height));
     let last_kept: Mutex<Option<Instant>> = Mutex::new(None);
+    let vp_state: Mutex<Option<VideoProcessor>> = Mutex::new(None);
 
     let closure_frame_pool = frame_pool.clone();
     let closure_direct3d_device = SendDirectX(direct3d_device.clone());
@@ -252,16 +278,57 @@ fn setup_capture(
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { texture.GetDesc(&mut desc) };
 
+            let output_size = super::aspect_fit_16(desc.Width, desc.Height, max_width, max_height);
+            let mut vp_guard = vp_state.lock().unwrap();
+            if vp_guard
+                .as_ref()
+                .is_none_or(|vp| vp.input_size() != (desc.Width, desc.Height) || vp.output_size() != output_size)
+            {
+                match VideoProcessor::new(&closure_device, &closure_context, fps, (desc.Width, desc.Height), output_size) {
+                    Ok(vp) => *vp_guard = Some(vp),
+                    Err(e) => {
+                        tracing::warn!("Failed to (re)create GPU video processor: {e:#}");
+                        return Ok(());
+                    }
+                }
+            }
+            let vp = vp_guard.as_mut().unwrap();
+
+            let gpu_start = Instant::now();
+            let nv12_texture = match vp.convert(&texture) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("GPU scale/colour-convert failed: {e:#}");
+                    return Ok(());
+                }
+            };
+            let gpu_time = gpu_start.elapsed();
+            diag::CAP_GPU_US.add_time(gpu_time);
+            diag::CAP_GPU_MAX_US.max_time(gpu_time);
+
             let readback_start = Instant::now();
-            let data = read_back(&closure_device, &closure_context, &texture, &desc)?;
+            let (y, uv) = match video_processor::read_back_nv12(
+                &closure_device,
+                &closure_context,
+                nv12_texture,
+                output_size.0,
+                output_size.1,
+            ) {
+                Ok(planes) => planes,
+                Err(e) => {
+                    tracing::warn!("NV12 readback failed: {e}");
+                    return Ok(());
+                }
+            };
             let readback = readback_start.elapsed();
             diag::CAP_READBACK_US.add_time(readback);
             diag::CAP_READBACK_MAX_US.max_time(readback);
 
             let frame = Frame {
-                width: desc.Width,
-                height: desc.Height,
-                data,
+                width: output_size.0,
+                height: output_size.1,
+                y,
+                uv,
                 timestamp: Instant::now(),
             };
 
@@ -398,55 +465,6 @@ fn duration_to_timespan(d: Duration) -> TimeSpan {
     }
 }
 
-/// Copies a captured D3D11 texture into a tightly packed BGRA8 buffer via a
-/// CPU staging texture. Same cost profile as the readback `windows-capture`
-/// did (one GPU-side copy, one map, one row-by-row memcpy) — phase 2 is what
-/// removes this step for the hardware-encoder path.
-fn read_back(
-    device: &ID3D11Device,
-    context: &ID3D11DeviceContext,
-    texture: &ID3D11Texture2D,
-    desc: &D3D11_TEXTURE2D_DESC,
-) -> windows::core::Result<Vec<u8>> {
-    let staging_desc = D3D11_TEXTURE2D_DESC {
-        Width: desc.Width,
-        Height: desc.Height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: desc.Format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-        MiscFlags: 0,
-    };
-
-    let mut staging = None;
-    unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
-    let staging = staging.expect("CreateTexture2D succeeded without producing a texture");
-
-    unsafe { context.CopyResource(&staging, texture) };
-
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
-
-    let width = desc.Width as usize;
-    let height = desc.Height as usize;
-    let row_bytes = width * 4;
-    let mut out = vec![0u8; row_bytes * height];
-    unsafe {
-        let src = mapped.pData as *const u8;
-        for y in 0..height {
-            let src_row = src.add(y * mapped.RowPitch as usize);
-            let dst_row = out.as_mut_ptr().add(y * row_bytes);
-            std::ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
-        }
-        context.Unmap(&staging, 0);
-    }
-
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,7 +480,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let paused = Arc::new(AtomicBool::new(false));
 
-        let session = start_capture(CaptureTarget::Monitor(monitor), tx, paused, 30)
+        let session = start_capture(CaptureTarget::Monitor(monitor), tx, paused, 30, 1920, 1080)
             .expect("start_capture should succeed on a real desktop session");
 
         let mut seen = 0;
@@ -471,11 +489,29 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("expected a frame within 5s");
             assert!(frame.width > 0 && frame.height > 0, "frame has zero dimension");
+            assert_eq!(frame.width % 16, 0, "frame width isn't 16-aligned");
+            assert_eq!(frame.height % 16, 0, "frame height isn't 16-aligned");
             assert_eq!(
-                frame.data.len(),
-                (frame.width * frame.height * 4) as usize,
-                "frame data isn't tightly packed BGRA8"
+                frame.y.len(),
+                (frame.width * frame.height) as usize,
+                "Y plane isn't tightly packed"
             );
+            assert_eq!(
+                frame.uv.len(),
+                (frame.width * frame.height / 2) as usize,
+                "UV plane isn't tightly packed"
+            );
+
+            // The whole point of the GPU video processor (phase 2) is to
+            // feed the encoder directly; make sure what comes out the other
+            // end is actually valid encoder input, not just correctly shaped.
+            let mut encoder = crate::codec::H264Encoder::new(frame.width, frame.height, 30)
+                .expect("encoder should accept the video processor's NV12 output");
+            let encoded = encoder
+                .encode(&frame.y, &frame.uv)
+                .expect("encoding a real captured frame should succeed");
+            assert!(!encoded.is_empty(), "first frame should encode to a keyframe");
+
             seen += 1;
         }
         assert_eq!(seen, 3);
