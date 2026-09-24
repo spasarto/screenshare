@@ -86,6 +86,14 @@ pub fn set_encoder(name: &str) {
     *ENCODER_NAME.lock().unwrap() = name.to_string();
 }
 
+/// Which decoder the decoder thread is using, named in the `decode` part of
+/// the `receive` line.
+static DECODER_NAME: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_decoder(name: &str) {
+    *DECODER_NAME.lock().unwrap() = name.to_string();
+}
+
 // Sender task.
 pub static SND_IN: Counter = Counter::new();
 pub static SND_DROP_STATE: Counter = Counter::new();
@@ -107,7 +115,8 @@ pub static DEC_NONE: Counter = Counter::new();
 pub static DEC_ERR: Counter = Counter::new();
 pub static DEC_US: Counter = Counter::new();
 pub static DEC_MAX_US: Counter = Counter::new();
-/// A decoded frame replaced one the GUI never picked up.
+/// A decoded frame replaced one the GUI never picked up, or the decoder
+/// produced several at once and only the newest was kept.
 pub static DEC_OVERWRITTEN: Counter = Counter::new();
 
 // GUI thread.
@@ -190,6 +199,7 @@ fn reporter() {
         let gui_paints = GUI_PAINTS.take();
 
         let encoder = ENCODER_NAME.lock().unwrap().clone();
+        let decoder = DECODER_NAME.lock().unwrap().clone();
 
         let anything = cap_arrived + enc_in + snd_in + rcv_msgs + dec_in + gui_up;
         if anything == 0 {
@@ -228,7 +238,7 @@ fn reporter() {
         );
         tracing::info!(
             "pipeline | receive: msgs {rcv_msgs}, {:.2} Mbit, queue wait {:.0}ms | \
-             decode: in {dec_in}, frames {dec_frame}, none {dec_none}, err {dec_err}, \
+             decode [{decoder}]: in {dec_in}, frames {dec_frame}, none {dec_none}, err {dec_err}, \
              avg {:.1}ms max {:.1}ms, overwritten before display {dec_over} | \
              gui: paints {gui_paints}, uploads {gui_up}, upload avg {:.1}ms",
             rcv_bytes as f64 * 8.0 / 1e6 / secs,

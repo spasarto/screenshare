@@ -1,4 +1,4 @@
-use super::{EncoderInput, VideoEncoder, bitrate_for};
+use super::{EncoderInput, Nv12Frame, VideoDecoder, VideoEncoder, bitrate_for};
 use anyhow::{Context, Result};
 use openh264::OpenH264API;
 use openh264::decoder::Decoder;
@@ -134,19 +134,40 @@ impl H264Decoder {
         let decoder = Decoder::new().context("Failed to create H264 decoder")?;
         Ok(Self { decoder })
     }
+}
 
-    /// Decode H264 NAL units into an RGBA frame. Returns (width, height, rgba_data).
-    pub fn decode(&mut self, h264_data: &[u8]) -> Result<Option<(u32, u32, Vec<u8>)>> {
-        let yuv = match self.decoder.decode(h264_data) {
+impl VideoDecoder for H264Decoder {
+    /// OpenH264 decodes to strided I420; this packs it into NV12 (Y copied
+    /// row by row, U/V interleaved), one cheap pass instead of the full
+    /// RGBA conversion the viewer used to need.
+    fn decode(&mut self, h264: &[u8]) -> Result<Option<Nv12Frame>> {
+        let yuv = match self.decoder.decode(h264) {
             Ok(Some(yuv)) => yuv,
             Ok(None) => return Ok(None),
             Err(e) => return Err(anyhow::anyhow!("H264 decode failed: {e}")),
         };
 
         let (width, height) = yuv.dimensions();
-        let mut rgba = vec![0u8; width * height * 4];
-        yuv.write_rgba8(&mut rgba);
+        let (y_stride, u_stride, v_stride) = yuv.strides();
+        let (cw, ch) = (width / 2, height / 2);
 
-        Ok(Some((width as u32, height as u32, rgba)))
+        let mut y = vec![0u8; width * height];
+        for (row, dst) in y.chunks_exact_mut(width).enumerate() {
+            dst.copy_from_slice(&yuv.y()[row * y_stride..][..width]);
+        }
+        let mut uv = vec![0u8; cw * 2 * ch];
+        for (row, dst) in uv.chunks_exact_mut(cw * 2).enumerate() {
+            let u = &yuv.u()[row * u_stride..][..cw];
+            let v = &yuv.v()[row * v_stride..][..cw];
+            for (pair, (&u, &v)) in dst.as_chunks_mut::<2>().0.iter_mut().zip(u.iter().zip(v)) {
+                *pair = [u, v];
+            }
+        }
+
+        Ok(Some(Nv12Frame { width: width as u32, height: height as u32, y, uv }))
+    }
+
+    fn name(&self) -> &str {
+        "OpenH264"
     }
 }

@@ -1,6 +1,8 @@
+pub mod mf_decoder;
 pub mod mf_encoder;
 pub mod openh264_impl;
 
+pub use mf_decoder::MfDecoder;
 pub use mf_encoder::MfEncoder;
 pub use openh264_impl::{H264Decoder, H264Encoder};
 
@@ -25,6 +27,31 @@ pub trait VideoEncoder {
     /// The frame size this encoder was created for; a frame of any other
     /// size needs a new encoder.
     fn size(&self) -> (u32, u32);
+}
+
+/// A decoded picture in NV12: a full-size Y plane, then a half-size plane
+/// of interleaved U/V pairs, both tightly packed (row stride = `width`
+/// bytes). `width` and `height` are even, as 4:2:0 H.264 guarantees. This
+/// is what the viewer uploads and converts to RGB on the GPU (phase 5 of
+/// `docs/hardware-encoding-plan.md`).
+pub struct Nv12Frame {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height` bytes.
+    pub y: Vec<u8>,
+    /// `width * height / 2` bytes: `height / 2` rows of `width / 2` U/V pairs.
+    pub uv: Vec<u8>,
+}
+
+/// An H.264 decoder: Media Foundation's ([`MfDecoder`], hardware-accelerated
+/// where the GPU allows) or OpenH264 ([`H264Decoder`]), the fallback. Like
+/// [`VideoEncoder`], created and used on one thread only.
+pub trait VideoDecoder {
+    /// Decodes one access unit (Annex-B). `None` when it produced no picture
+    /// (parameter sets only, or the decoder is still waiting for an IDR).
+    fn decode(&mut self, h264: &[u8]) -> Result<Option<Nv12Frame>>;
+    /// For logs: "Microsoft H264 Video Decoder MFT (DXVA)", "OpenH264", ...
+    fn name(&self) -> &str;
 }
 
 /// Bits per pixel per frame the encoder is budgeted. 0.07 is what the old

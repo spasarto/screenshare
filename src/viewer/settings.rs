@@ -57,9 +57,11 @@ impl FrameRate {
     }
 }
 
-/// Which H.264 encoder a session uses. Automatic tries the GPU's hardware
-/// encoder and falls back to OpenH264 if it won't start or fails; see phase 4
-/// of `docs/hardware-encoding-plan.md`.
+/// Which H.264 encoder and decoder a session uses. Automatic tries the GPU
+/// (the hardware encoder; Media Foundation's decoder, on DXVA where it can)
+/// and falls back to OpenH264 if they won't start or fail; see phases 4 and
+/// 5 of `docs/hardware-encoding-plan.md`. Stored as `encoder`, its name from
+/// before it covered decoding too.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncoderChoice {
     Automatic,
@@ -146,7 +148,7 @@ impl Settings {
             max_width,
             max_height,
             fps: self.frame_rate.fps(),
-            hardware_encoder: self.encoder == EncoderChoice::Automatic,
+            hardware_video: self.encoder == EncoderChoice::Automatic,
         }
     }
 }
@@ -227,7 +229,7 @@ impl SettingsPanel {
                     });
                     ui.end_row();
 
-                    ui.label("Video encoder");
+                    ui.label("Video codec");
                     ui.horizontal(|ui| {
                         for e in EncoderChoice::ALL {
                             if widgets::toggle_button(ui, draft.encoder == e, e.label()).clicked() {
@@ -239,7 +241,7 @@ impl SettingsPanel {
                 });
             ui.colored_label(
                 p.ink_3,
-                "Automatic uses your graphics card when it can, and falls back to software if it can't.",
+                "Automatic encodes and decodes on your graphics card when it can, and falls back to software if it can't.",
             );
 
             ui.add_space(theme::space::LG);
@@ -337,13 +339,13 @@ mod tests {
     }
 
     #[test]
-    fn hardware_encoding_is_on_unless_software_only() {
-        assert!(Settings::default().quality().hardware_encoder);
+    fn hardware_video_is_on_unless_software_only() {
+        assert!(Settings::default().quality().hardware_video);
         let s = Settings {
             encoder: EncoderChoice::SoftwareOnly,
             ..Settings::default()
         };
-        assert!(!s.quality().hardware_encoder);
+        assert!(!s.quality().hardware_video);
     }
 
     #[test]

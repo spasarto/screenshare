@@ -487,10 +487,10 @@ impl Drop for MfEncoder {
 /// Holds the process's multithreaded COM apartment open, which puts every
 /// thread that hasn't initialised COM itself (the encoder thread, the event
 /// pump) in it implicitly — what hardware MFTs expect.
-struct MtaGuard(CO_MTA_USAGE_COOKIE);
+pub(super) struct MtaGuard(CO_MTA_USAGE_COOKIE);
 
 impl MtaGuard {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let cookie = unsafe { CoIncrementMTAUsage() }.context("CoIncrementMTAUsage failed")?;
         Ok(Self(cookie))
     }
@@ -503,9 +503,9 @@ impl Drop for MtaGuard {
 }
 
 /// `MFStartup`, once per process. Never paired with `MFShutdown`: an
-/// encoder can be created again at any time, and the process exiting
+/// encoder or decoder can be created again at any time, and the process exiting
 /// cleans up.
-fn ensure_mf_started() -> Result<()> {
+pub(super) fn ensure_mf_started() -> Result<()> {
     static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     STARTED
         .get_or_init(|| unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.map_err(|e| e.to_string()))
@@ -574,7 +574,7 @@ fn friendly_name(activate: &IMFActivate) -> Option<String> {
 
 /// Input and output stream IDs. Most MFTs use fixed IDs and say so with
 /// `E_NOTIMPL`, which means 0 for both.
-fn stream_ids(transform: &IMFTransform) -> Result<(u32, u32)> {
+pub(super) fn stream_ids(transform: &IMFTransform) -> Result<(u32, u32)> {
     let mut input = [0u32];
     let mut output = [0u32];
     match unsafe { transform.GetStreamIDs(&mut input, &mut output) } {
@@ -775,6 +775,7 @@ mod tests {
     #[ignore]
     fn hardware_encodes_real_frames_openh264_can_decode() {
         use crate::capture::{CaptureTarget, session::start_capture};
+        use crate::codec::VideoDecoder as _;
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
@@ -823,8 +824,8 @@ mod tests {
                 println!("SPS profile_idc {profile_idc}, constraint flags {constraints:#04x}");
                 assert_eq!(profile_idc, 66, "encoder ignored the Baseline profile request");
             }
-            if let Some((w, h, _)) = decoder.decode(&h264).expect("OpenH264 should decode the hardware stream") {
-                assert_eq!((w, h), (encoder.width, encoder.height));
+            if let Some(picture) = decoder.decode(&h264).expect("OpenH264 should decode the hardware stream") {
+                assert_eq!((picture.width, picture.height), (encoder.width, encoder.height));
                 decoded += 1;
             }
         }

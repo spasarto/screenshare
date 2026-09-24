@@ -382,11 +382,12 @@ impl Drop for WinRtGuard {
 }
 
 /// Creates the D3D11 device the capture, GPU scaling (phase 2) and hardware
-/// encoder MFT (phase 3) will all share. `VIDEO_SUPPORT` is what
+/// encoder MFT (phase 3) will all share; the receive side's hardware decoder
+/// (phase 5) makes its own the same way. `VIDEO_SUPPORT` is what
 /// `windows-capture`'s own device lacks; `SetMultithreadProtected` is needed
 /// because the capture thread and a future encoder thread both touch the
 /// immediate context.
-fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let feature_levels = [
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,

@@ -1,7 +1,7 @@
 # Hardware video encoding plan
 
 Date: 2026-09-18
-Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phase 3 landed (2026-09-23), verified on AMD only. Phase 4 landed (2026-09-23). Phases 5+ not started.
+Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phase 3 landed (2026-09-23), verified on AMD only. Phase 4 landed (2026-09-23). Phase 5 landed (2026-09-23), verified on AMD only. Phase 6 not started.
 
 ## Why
 
@@ -328,7 +328,7 @@ Not yet verified by hand: forcing each fallback trigger in a live session,
 and the Settings toggle end to end. Unit tests cover the setting's default
 and migration, and the stats label.
 
-### Phase 5: receive side (M–L)
+### Phase 5: receive side (M–L) — landed, AMD verified
 
 At 60 fps the receiver's ~20 ms OpenH264 decode and ~7 ms 14 MB RGBA upload
 are over budget. In order of payoff:
@@ -343,6 +343,70 @@ are over budget. In order of payoff:
 
 Keep OpenH264 as the decoder fallback.
 
+Landed as `src/codec/mf_decoder.rs` (`MfDecoder`) and
+`src/viewer/remote_screen.rs` (`RemoteScreen`), with a `VideoDecoder` trait
+and an `Nv12Frame` type (tightly packed Y and interleaved UV planes) in
+`src/codec/mod.rs`. Differences from the plan above, and details:
+
+- **NV12 all the way to the GPU.** Both decoders produce `Nv12Frame`.
+  OpenH264's strided I420 is packed into NV12 in one pass (Y rows copied,
+  U/V interleaved), replacing `write_rgba8`. The slot the GUI takes frames
+  from holds `Nv12Frame`; `DecodedFrame` (RGBA) is left only for the small
+  outgoing preview.
+- **A render pass, not a paint callback.** The GUI thread uploads Y
+  (`R8Unorm`) and UV (`Rg8Unorm`) with `queue.write_texture`, then one render
+  pass converts them (BT.709 studio range, matching the sender's video
+  processor and VUI) into an `Rgba8Unorm` texture registered with egui via
+  `register_native_texture`. egui draws that as an ordinary image, so Fit and
+  Actual zoom and the scroll area are unchanged. A paint callback would have
+  needed a viewport reaching past the window at Actual zoom, which wgpu
+  rejects. The texture ID is registered once and re-pointed at the new
+  texture when the size changes. Without a wgpu render state (which can't
+  happen in this build) it falls back to converting to RGBA on the CPU.
+- **Decoder:** Microsoft's H.264 decoder MFT (`CLSID_MSH264DecoderMFT`), which
+  is synchronous, with `MF_LOW_LATENCY` and `CODECAPI_AVLowLatencyMode` so it
+  doesn't hold frames back for reordering. It gets its own D3D11 device
+  (`capture::session::create_device`) through an `IMFDXGIDeviceManager`, so it
+  decodes with DXVA. Each output texture (one slice of the decoder's texture
+  array) is copied to a cached staging texture with `CopySubresourceRegion`
+  and read back as NV12, cropped to `MF_MT_MINIMUM_DISPLAY_APERTURE`. If the
+  MFT refuses the device, it decodes in software into system memory
+  (`IMF2DBuffer::Lock2D`), which is still multithreaded.
+  `MF_E_TRANSFORM_STREAM_CHANGE` re-picks NV12 output and re-reads the
+  layout. When one input yields several pictures, only the newest is kept
+  (counted in `overwritten before display`).
+- **Selection and fallback:** `DecoderSelector` in `app.rs`, modelled on
+  `EncoderSelector`. If the MFT fails to start, returns any decode error, or
+  produces no picture within `HW_FIRST_OUTPUT_WITHIN` (30) frames of the
+  first IDR, the session switches to OpenH264 for good. The frame that failed
+  is re-fed to OpenH264; otherwise the picture comes back at the next IDR
+  (≤ 2 s).
+- **Setting:** the phase 4 setting now covers both directions and is
+  relabelled "Video codec" (Automatic / Software only). Software only means
+  OpenH264 both ways. `Quality::hardware_encoder` is now `hardware_video`.
+  The saved field is still `encoder`, so existing settings carry over.
+- **Stats:** a "Decoder" row under Receiving (Hardware / Software /
+  Software (fallback)), from `SessionStats::decoder`. `EncoderInfo` is now
+  `CodecInfo`, shared by both rows. The diag `decode [<name>]` line names the
+  decoder.
+
+Verified on an AMD GPU (RX 7900 XTX):
+
+- `cargo test --bin screenshare codec::mf_decoder::tests -- --ignored
+  --nocapture` captures the primary monitor at 1920×1080, encodes with
+  OpenH264 and decodes with the MFT on DXVA. All 30 frames decoded, one out
+  per one in, at **~3–4 ms each in a debug build** (first IDR 17 ms), with
+  luma within a few levels of the source.
+- A GPU unit test (`viewer::remote_screen::tests`) checks the shader's BT.709
+  conversion against known white and red.
+- In a two-instance session on one machine (debug build, sharing a Notepad
+  window), the receiver picked `Microsoft H.264 decoder (DXVA)`, decoded at
+  3.1–4.9 ms average, and the GUI upload fell to ~0.9 ms.
+
+**Not yet done:** NVIDIA and Intel, the 1440p60 stress test, forcing each
+decoder fallback in a live session, and checking colours by eye in the
+running app (only the unit test checks them).
+
 ### Phase 6: follow-ups (S each)
 
 - A 4K / "native" resolution option once 1440p60 holds.
@@ -352,8 +416,9 @@ Keep OpenH264 as the decoder fallback.
 
 ## Risks and open questions
 
-- **Profile compatibility with the OpenH264 decoder.** Until phase 5 lands,
-  the receiver decodes with OpenH264, which is built around Constrained
+- **Profile compatibility with the OpenH264 decoder.** Since phase 5 the
+  receiver decodes with Media Foundation where it can, but OpenH264 is still
+  the fallback, which is built around Constrained
   Baseline. Hardware encoders default to Main/High (CABAC, B-frames). Ask for
   `eAVEncH264VProfile_ConstrainedBase` (B-frames already off). Verify every
   vendor honours it, and check whether OpenH264 decodes Main/High well enough

@@ -6,7 +6,7 @@
 //! [`crate::transport::SessionStats`]); [`Sampler`] turns those into rates
 //! here, at a pace the panel can actually be read at.
 
-use crate::transport::{EncoderInfo, SessionStats, SharedConnState};
+use crate::transport::{CodecInfo, SessionStats, SharedConnState};
 use crate::viewer::{theme, widgets};
 use egui::{RichText, Ui};
 use std::sync::atomic::Ordering;
@@ -112,6 +112,7 @@ pub fn show_panel(ui: &mut Ui, cx: &PanelContext) {
         ("Resolution", format_size(cx.stats.remote_size())),
         ("Frame rate", format_fps(cx.rates.rx_fps)),
         ("Bitrate", format_bitrate(cx.rates.rx_bits_per_sec)),
+        ("Decoder", format_codec(cx.stats.decoder().as_ref())),
     ]);
 
     ui.add_space(theme::space::LG);
@@ -124,7 +125,7 @@ pub fn show_panel(ui: &mut Ui, cx: &PanelContext) {
             ("Resolution", format_size(cx.stats.local_size())),
             ("Frame rate", format_fps(cx.rates.tx_fps)),
             ("Bitrate", format_bitrate(cx.rates.tx_bits_per_sec)),
-            ("Encoder", format_encoder(cx.stats.encoder().as_ref())),
+            ("Encoder", format_codec(cx.stats.encoder().as_ref())),
         ]);
     }
 }
@@ -169,8 +170,8 @@ fn format_fps(fps: f64) -> String {
 }
 
 /// "Hardware", "Software", or "Software (fallback)" when the hardware
-/// encoder was allowed but couldn't be used.
-fn format_encoder(info: Option<&EncoderInfo>) -> String {
+/// encoder or decoder was allowed but couldn't be used.
+fn format_codec(info: Option<&CodecInfo>) -> String {
     match info {
         None => "\u{2014}".to_string(),
         Some(e) if e.hardware => "Hardware".to_string(),
@@ -201,12 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn encoder_says_when_it_fell_back() {
-        let info = |hardware, fell_back| EncoderInfo { hardware, fell_back };
-        assert_eq!(format_encoder(Some(&info(true, false))), "Hardware");
-        assert_eq!(format_encoder(Some(&info(false, false))), "Software");
-        assert_eq!(format_encoder(Some(&info(false, true))), "Software (fallback)");
-        assert_eq!(format_encoder(None), "\u{2014}");
+    fn codec_says_when_it_fell_back() {
+        let info = |hardware, fell_back| CodecInfo { hardware, fell_back };
+        assert_eq!(format_codec(Some(&info(true, false))), "Hardware");
+        assert_eq!(format_codec(Some(&info(false, false))), "Software");
+        assert_eq!(format_codec(Some(&info(false, true))), "Software (fallback)");
+        assert_eq!(format_codec(None), "\u{2014}");
     }
 
     #[test]

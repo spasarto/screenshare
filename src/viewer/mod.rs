@@ -1,5 +1,6 @@
 mod log_drawer;
 mod picker_grid;
+mod remote_screen;
 pub mod settings;
 mod stats;
 mod theme;
@@ -16,6 +17,7 @@ use crate::transport::peer::MAX_RECONNECT_ATTEMPTS;
 use egui::{Rect, TextureHandle, Vec2};
 use log_drawer::LogDrawer;
 use picker_grid::{PickerGrid, SavedTarget};
+use remote_screen::RemoteScreen;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsPanel};
 use std::sync::Arc;
@@ -71,6 +73,7 @@ const DETAILS_MAX_HEIGHT: f32 = 96.0;
 /// Slightly over the session thread's own goodbye timeout.
 const EXIT_GOODBYE_WAIT: Duration = Duration::from_millis(600);
 
+/// A small RGBA still: the outgoing-frame preview in the sharing bar.
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
@@ -253,7 +256,7 @@ pub struct App {
 
     // Viewing
     session: Option<SessionHandle>,
-    texture: Option<TextureHandle>,
+    remote_screen: RemoteScreen,
     viewer: ViewerState,
 
     /// For waking the GUI from the decoder thread.
@@ -377,7 +380,7 @@ impl App {
             copied: None,
             active_share: None,
             session: None,
-            texture: None,
+            remote_screen: RemoteScreen::new(cc.wgpu_render_state.as_ref()),
             viewer: ViewerState::new(),
             egui_ctx: cc.egui_ctx.clone(),
             logo_texture,
@@ -459,7 +462,7 @@ impl App {
         self.stage = Stage::ContactingServer;
         self.copied = None;
         self.session = None;
-        self.texture = None;
+        self.remote_screen.clear();
     }
 
     /// Starts a new session the same way round as the one that just ended:
@@ -553,7 +556,7 @@ impl App {
                     // once connected; nothing left for us to clean up.
                     self.hosted_session_code = None;
                     self.session = Some(session);
-                    self.texture = None;
+                    self.remote_screen.clear();
                     self.viewer.start_session();
                     self.network_notice_seen = true;
                     self.phase = Phase::Viewing;
@@ -771,12 +774,12 @@ impl App {
         self.last_create_pin = create_pin.clone();
         let quality = self.settings.quality();
         tracing::info!(
-            "Starting session via {} at up to {}x{}, {} fps, {} encoder",
+            "Starting session via {} at up to {}x{}, {} fps, {} video codec",
             self.session_server_url,
             quality.max_width,
             quality.max_height,
             quality.fps,
-            if quality.hardware_encoder { "automatic" } else { "software-only" }
+            if quality.hardware_video { "automatic" } else { "software-only" }
         );
 
         match self.role {
@@ -1096,7 +1099,7 @@ impl App {
         let state = conn.get();
         let paused = session.is_paused();
         let fullscreen = self.viewer.fullscreen;
-        let has_frame = self.texture.is_some();
+        let has_frame = self.remote_screen.texture().is_some();
         // Stops counting once the session has ended.
         let duration = if state == ConnState::Failed {
             conn.since().saturating_duration_since(self.viewer.connected_at)
@@ -1206,8 +1209,8 @@ impl App {
             .frame(egui::Frame::NONE.fill(p.bg))
             .show(ui, |ui| {
                 let area = ui.max_rect();
-                match &self.texture {
-                    Some(tex) => self.paint_remote_screen(ui, tex, area),
+                match self.remote_screen.texture() {
+                    Some((id, size)) => self.paint_remote_screen(ui, id, size, area),
                     None if state != ConnState::Failed => {
                         self.show_waiting_for_frames(&ctx, area, conn.peer_paused());
                     }
@@ -1264,17 +1267,7 @@ impl App {
         let remote = session.frame_buffer.lock().unwrap().take();
         if let Some(decoded) = remote {
             let upload_start = std::time::Instant::now();
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [decoded.width as usize, decoded.height as usize],
-                &decoded.rgba,
-            );
-            match &mut self.texture {
-                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                None => {
-                    self.texture =
-                        Some(ctx.load_texture("remote_screen", image, egui::TextureOptions::LINEAR));
-                }
-            }
+            self.remote_screen.upload(ctx, &decoded);
             crate::diag::GUI_UPLOADS.inc();
             crate::diag::GUI_UPLOAD_US.add_time(upload_start.elapsed());
         }
@@ -1334,14 +1327,13 @@ impl App {
         }
     }
 
-    fn paint_remote_screen(&self, ui: &mut egui::Ui, tex: &TextureHandle, area: Rect) {
+    fn paint_remote_screen(&self, ui: &mut egui::Ui, tex: egui::TextureId, tex_size: Vec2, area: Rect) {
         let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        let tex_size = tex.size_vec2();
         match self.viewer.zoom {
             Zoom::Fit => {
                 let scale = (area.width() / tex_size.x).min(area.height() / tex_size.y);
                 let rect = Rect::from_center_size(area.center(), tex_size * scale);
-                ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+                ui.painter().image(tex, rect, uv, egui::Color32::WHITE);
             }
             Zoom::Actual => {
                 // Texture pixels are physical; the layout is in points.
@@ -1354,7 +1346,7 @@ impl App {
                             egui::Sense::hover(),
                         );
                         let rect = Rect::from_center_size(rect.center(), size);
-                        ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+                        ui.painter().image(tex, rect, uv, egui::Color32::WHITE);
                     });
             }
         }

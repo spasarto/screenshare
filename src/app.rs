@@ -1,13 +1,13 @@
 use crate::capture;
 use crate::capture::CaptureTarget;
-use crate::codec::{H264Decoder, H264Encoder, MfEncoder, VideoEncoder};
+use crate::codec::{H264Decoder, H264Encoder, MfDecoder, MfEncoder, Nv12Frame, VideoDecoder, VideoEncoder};
 use crate::diag;
 use crate::failure::{SessionFailure, Step};
 use crate::signaling_server::SignalingServer;
 use crate::transport::control::Control;
 use crate::transport::framing::IncomingMessage;
 use crate::transport::peer::{self, PeerConnection};
-use crate::transport::{ConnState, EncoderInfo, SessionStats, SharedConnState};
+use crate::transport::{CodecInfo, ConnState, SessionStats, SharedConnState};
 use crate::viewer::DecodedFrame;
 use anyhow::{Context as _, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,8 +43,10 @@ const PREVIEW_INTERVAL: Duration = Duration::from_secs(1);
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A hardware encoder that has taken this many frames without producing any
-/// output is treated as broken, and the session falls back to OpenH264.
-/// Generous: some encoders hold a few frames back before the first comes out.
+/// output is treated as broken, and the session falls back to OpenH264; so
+/// is a Media Foundation decoder that has taken this many frames since an
+/// IDR without producing a picture. Generous: some encoders hold a few
+/// frames back before the first comes out.
 const HW_FIRST_OUTPUT_WITHIN: u32 = 30;
 
 /// Wakes the GUI. The decoder calls it whenever a frame lands, so the viewer
@@ -61,15 +63,16 @@ pub enum Role {
 
 /// What a session sends: the largest frame the encoder is fed (captures are
 /// scaled down to fit, never up), how many frames a second it takes, and
-/// whether it may use the GPU's hardware encoder.
+/// whether it may encode and decode on the GPU.
 #[derive(Clone, Copy, Debug)]
 pub struct Quality {
     pub max_width: u32,
     pub max_height: u32,
     pub fps: u32,
-    /// Try the hardware encoder first, falling back to OpenH264 (the
-    /// "Automatic" setting). Off means OpenH264 only.
-    pub hardware_encoder: bool,
+    /// Try the hardware encoder and Media Foundation's decoder first,
+    /// falling back to OpenH264 (the "Automatic" setting). Off means
+    /// OpenH264 only, both ways.
+    pub hardware_video: bool,
 }
 
 /// Where a session has got to in the signaling handshake. Reported to the
@@ -101,7 +104,7 @@ pub struct SessionHandle {
     pub conn_state: SharedConnState,
     pub stats: Arc<SessionStats>,
     /// The latest decoded remote frame, taken by the viewer when it draws.
-    pub frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
+    pub frame_buffer: Arc<Mutex<Option<Nv12Frame>>>,
     /// A small, roughly once-a-second copy of what we are sending. Taken from
     /// the encoder's input, so it is right for monitors and windows alike.
     pub outgoing_preview: Arc<Mutex<Option<DecodedFrame>>>,
@@ -567,7 +570,7 @@ struct MediaThreads {
     incoming_rx: mpsc::Receiver<Vec<u8>>,
     signaling_tx: mpsc::Sender<Vec<u8>>,
     peer_control_tx: mpsc::Sender<Control>,
-    frame_buffer: Arc<Mutex<Option<DecodedFrame>>>,
+    frame_buffer: Arc<Mutex<Option<Nv12Frame>>>,
     outgoing_preview: Arc<Mutex<Option<DecodedFrame>>>,
     paused: Arc<AtomicBool>,
     conn_state: SharedConnState,
@@ -665,12 +668,8 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
     std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || {
-            let mut decoder = match H264Decoder::new() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("Failed to create decoder: {e}");
-                    return;
-                }
+            let Some(mut decoder) = DecoderSelector::new(quality.hardware_video, stats.clone()) else {
+                return;
             };
 
             let mut incoming_rx = incoming_rx;
@@ -718,19 +717,15 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
                 diag::DEC_US.add_time(decode_time);
                 diag::DEC_MAX_US.max_time(decode_time);
                 match result {
-                    Ok(Some((w, h, rgba))) => {
+                    Ok(Some(frame)) => {
                         stats.add_received(h264_data.len());
-                        stats.set_remote_size(w, h);
+                        stats.set_remote_size(frame.width, frame.height);
                         diag::DEC_FRAME.inc();
                         let mut slot = fb.lock().unwrap();
                         if slot.is_some() {
                             diag::DEC_OVERWRITTEN.inc();
                         }
-                        *slot = Some(DecodedFrame {
-                            width: w,
-                            height: h,
-                            rgba,
-                        });
+                        *slot = Some(frame);
                         drop(slot);
                         repaint();
                     }
@@ -778,8 +773,8 @@ impl EncoderSelector {
         Self {
             fps: quality.fps,
             stats,
-            hardware_wanted: quality.hardware_encoder,
-            hardware_allowed: quality.hardware_encoder,
+            hardware_wanted: quality.hardware_video,
+            hardware_allowed: quality.hardware_video,
             current: None,
         }
     }
@@ -829,7 +824,7 @@ impl EncoderSelector {
         );
         diag::set_encoder(&name);
         self.stats.set_local_size(w, h);
-        self.stats.set_encoder(EncoderInfo {
+        self.stats.set_encoder(CodecInfo {
             hardware,
             fell_back: self.hardware_wanted && !hardware,
         });
@@ -877,6 +872,109 @@ impl EncoderSelector {
             return Err(failure.context("software fallback failed to start too"));
         }
         self.current.as_mut().context("no encoder")?.encoder.encode(frame)
+    }
+}
+
+/// Picks and owns the decoder thread's decoder: Media Foundation's H.264
+/// decoder (on the GPU where it can) when allowed and it starts, OpenH264
+/// otherwise. Like [`EncoderSelector`], a Media Foundation failure (an
+/// error, or no picture for [`HW_FIRST_OUTPUT_WITHIN`] frames after an IDR)
+/// switches to OpenH264 for the rest of the session. OpenH264 then needs the
+/// next IDR (at most [`KEYFRAME_INTERVAL`] away) before it shows anything.
+struct DecoderSelector {
+    decoder: Box<dyn VideoDecoder>,
+    stats: Arc<SessionStats>,
+    hardware_wanted: bool,
+    /// Whether `decoder` is Media Foundation's, and so may still fall back.
+    media_foundation: bool,
+    /// Frames fed since the first IDR while no picture has come out yet.
+    /// `None` before the first IDR, and once a picture has come out.
+    waiting_for_output: Option<u32>,
+}
+
+impl DecoderSelector {
+    fn new(hardware_wanted: bool, stats: Arc<SessionStats>) -> Option<Self> {
+        if hardware_wanted {
+            match MfDecoder::new(true) {
+                Ok(d) => {
+                    let hardware = d.is_hardware();
+                    return Some(Self::with(Box::new(d), true, hardware, hardware_wanted, stats));
+                }
+                Err(e) => tracing::warn!("Media Foundation decoder unavailable, using OpenH264: {e:#}"),
+            }
+        }
+        match H264Decoder::new() {
+            Ok(d) => Some(Self::with(Box::new(d), false, false, hardware_wanted, stats)),
+            Err(e) => {
+                tracing::error!("Failed to create decoder: {e:#}");
+                None
+            }
+        }
+    }
+
+    fn with(
+        decoder: Box<dyn VideoDecoder>,
+        media_foundation: bool,
+        hardware: bool,
+        hardware_wanted: bool,
+        stats: Arc<SessionStats>,
+    ) -> Self {
+        let selector = Self {
+            decoder,
+            stats,
+            hardware_wanted,
+            media_foundation,
+            waiting_for_output: None,
+        };
+        selector.announce(hardware);
+        selector
+    }
+
+    fn announce(&self, hardware: bool) {
+        let name = self.decoder.name();
+        tracing::info!("Decoding with {name} ({})", if hardware { "hardware" } else { "software" });
+        diag::set_decoder(name);
+        self.stats.set_decoder(CodecInfo {
+            hardware,
+            fell_back: self.hardware_wanted && !hardware,
+        });
+    }
+
+    fn decode(&mut self, h264: &[u8]) -> Result<Option<Nv12Frame>> {
+        let result = self.decoder.decode(h264);
+        if !self.media_foundation {
+            return result;
+        }
+
+        let failure = match result {
+            Err(e) => e,
+            Ok(Some(frame)) => {
+                self.waiting_for_output = None;
+                return Ok(Some(frame));
+            }
+            Ok(None) => {
+                if self.waiting_for_output.is_none() && diag::has_idr(h264) {
+                    self.waiting_for_output = Some(0);
+                }
+                let Some(waited) = &mut self.waiting_for_output else {
+                    return Ok(None);
+                };
+                *waited += 1;
+                if *waited < HW_FIRST_OUTPUT_WITHIN {
+                    return Ok(None);
+                }
+                anyhow::anyhow!("{}: no picture {waited} frames after an IDR", self.decoder.name())
+            }
+        };
+
+        tracing::warn!("Media Foundation decoder failed, using OpenH264 for the rest of the session: {failure:#}");
+        let openh264 = H264Decoder::new().map_err(|e| failure.context(format!("OpenH264 failed to start too: {e:#}")))?;
+        self.decoder = Box::new(openh264);
+        self.media_foundation = false;
+        self.waiting_for_output = None;
+        self.announce(false);
+        // Worth a try: this is an IDR often enough (the first frame, say).
+        self.decoder.decode(h264)
     }
 }
 
