@@ -57,6 +57,26 @@ impl FrameRate {
     }
 }
 
+/// Which H.264 encoder a session uses. Automatic tries the GPU's hardware
+/// encoder and falls back to OpenH264 if it won't start or fails; see phase 4
+/// of `docs/hardware-encoding-plan.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EncoderChoice {
+    Automatic,
+    SoftwareOnly,
+}
+
+impl EncoderChoice {
+    const ALL: [EncoderChoice; 2] = [EncoderChoice::Automatic, EncoderChoice::SoftwareOnly];
+
+    fn label(self) -> &'static str {
+        match self {
+            EncoderChoice::Automatic => "Automatic",
+            EncoderChoice::SoftwareOnly => "Software only",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeChoice {
     System,
@@ -89,6 +109,7 @@ impl ThemeChoice {
 pub struct Settings {
     pub resolution: Resolution,
     pub frame_rate: FrameRate,
+    pub encoder: EncoderChoice,
     pub theme: ThemeChoice,
     pub start_minimized: bool,
     /// Empty means [`DEFAULT_SERVER_URL`], so a user who never touches it
@@ -101,6 +122,7 @@ impl Default for Settings {
         Self {
             resolution: Resolution::P720,
             frame_rate: FrameRate::Fps30,
+            encoder: EncoderChoice::Automatic,
             theme: ThemeChoice::System,
             start_minimized: false,
             server_url: String::new(),
@@ -124,6 +146,7 @@ impl Settings {
             max_width,
             max_height,
             fps: self.frame_rate.fps(),
+            hardware_encoder: self.encoder == EncoderChoice::Automatic,
         }
     }
 }
@@ -203,7 +226,21 @@ impl SettingsPanel {
                         }
                     });
                     ui.end_row();
+
+                    ui.label("Video encoder");
+                    ui.horizontal(|ui| {
+                        for e in EncoderChoice::ALL {
+                            if widgets::toggle_button(ui, draft.encoder == e, e.label()).clicked() {
+                                draft.encoder = e;
+                            }
+                        }
+                    });
+                    ui.end_row();
                 });
+            ui.colored_label(
+                p.ink_3,
+                "Automatic uses your graphics card when it can, and falls back to software if it can't.",
+            );
 
             ui.add_space(theme::space::LG);
             widgets::section_header(ui, "Appearance");
@@ -297,5 +334,21 @@ mod tests {
     fn default_quality_matches_the_old_hard_coded_capture() {
         let q = Settings::default().quality();
         assert_eq!((q.max_width, q.max_height, q.fps), (1280, 720, 30));
+    }
+
+    #[test]
+    fn hardware_encoding_is_on_unless_software_only() {
+        assert!(Settings::default().quality().hardware_encoder);
+        let s = Settings {
+            encoder: EncoderChoice::SoftwareOnly,
+            ..Settings::default()
+        };
+        assert!(!s.quality().hardware_encoder);
+    }
+
+    #[test]
+    fn settings_saved_before_the_encoder_choice_default_to_automatic() {
+        let s: Settings = serde_json::from_str(r#"{"resolution":"P1080","frame_rate":"Fps60"}"#).unwrap();
+        assert!(s.encoder == EncoderChoice::Automatic);
     }
 }

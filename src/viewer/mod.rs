@@ -771,11 +771,12 @@ impl App {
         self.last_create_pin = create_pin.clone();
         let quality = self.settings.quality();
         tracing::info!(
-            "Starting session via {} at up to {}x{}, {} fps",
+            "Starting session via {} at up to {}x{}, {} fps, {} encoder",
             self.session_server_url,
             quality.max_width,
             quality.max_height,
-            quality.fps
+            quality.fps,
+            if quality.hardware_encoder { "automatic" } else { "software-only" }
         );
 
         match self.role {

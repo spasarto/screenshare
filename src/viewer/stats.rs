@@ -6,7 +6,7 @@
 //! [`crate::transport::SessionStats`]); [`Sampler`] turns those into rates
 //! here, at a pace the panel can actually be read at.
 
-use crate::transport::{SessionStats, SharedConnState};
+use crate::transport::{EncoderInfo, SessionStats, SharedConnState};
 use crate::viewer::{theme, widgets};
 use egui::{RichText, Ui};
 use std::sync::atomic::Ordering;
@@ -124,6 +124,7 @@ pub fn show_panel(ui: &mut Ui, cx: &PanelContext) {
             ("Resolution", format_size(cx.stats.local_size())),
             ("Frame rate", format_fps(cx.rates.tx_fps)),
             ("Bitrate", format_bitrate(cx.rates.tx_bits_per_sec)),
+            ("Encoder", format_encoder(cx.stats.encoder().as_ref())),
         ]);
     }
 }
@@ -167,6 +168,17 @@ fn format_fps(fps: f64) -> String {
     format!("{fps:.0} fps")
 }
 
+/// "Hardware", "Software", or "Software (fallback)" when the hardware
+/// encoder was allowed but couldn't be used.
+fn format_encoder(info: Option<&EncoderInfo>) -> String {
+    match info {
+        None => "\u{2014}".to_string(),
+        Some(e) if e.hardware => "Hardware".to_string(),
+        Some(e) if e.fell_back => "Software (fallback)".to_string(),
+        Some(_) => "Software".to_string(),
+    }
+}
+
 fn format_size(size: Option<(u32, u32)>) -> String {
     size.map_or_else(|| "\u{2014}".to_string(), |(w, h)| format!("{w}\u{00D7}{h}"))
 }
@@ -186,6 +198,15 @@ mod tests {
     fn bitrates_switch_units_at_one_megabit() {
         assert_eq!(format_bitrate(820_000.0), "820 kbps");
         assert_eq!(format_bitrate(2_430_000.0), "2.4 Mbps");
+    }
+
+    #[test]
+    fn encoder_says_when_it_fell_back() {
+        let info = |hardware, fell_back| EncoderInfo { hardware, fell_back };
+        assert_eq!(format_encoder(Some(&info(true, false))), "Hardware");
+        assert_eq!(format_encoder(Some(&info(false, false))), "Software");
+        assert_eq!(format_encoder(Some(&info(false, true))), "Software (fallback)");
+        assert_eq!(format_encoder(None), "\u{2014}");
     }
 
     #[test]

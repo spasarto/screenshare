@@ -1,7 +1,7 @@
 # Hardware video encoding plan
 
 Date: 2026-09-18
-Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phase 3 landed (2026-09-23), verified on AMD only. Phases 4+ not started.
+Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phase 3 landed (2026-09-23), verified on AMD only. Phase 4 landed (2026-09-23). Phases 5+ not started.
 
 ## Why
 
@@ -279,10 +279,8 @@ Landed as `src/codec/mf_encoder.rs` (`MfEncoder`), with the trait in
   from phase 2. The video processor still stretches into the ≤15 px of
   16-alignment padding, because OpenH264 (the fallback) has no cropping to
   match.
-- **Selection is opt-in for now:** set `SCREENSHARE_HW_ENCODER=1` to use the
-  hardware encoder. If it fails to create, the app logs why and uses
-  OpenH264. Errors during encoding are not yet a fallback trigger; phase 4
-  makes Automatic the default and adds that.
+- **Selection was opt-in** through a `SCREENSHARE_HW_ENCODER` environment
+  variable until phase 4 replaced it with a setting.
 
 Verified with `cargo test --bin screenshare codec::mf_encoder::tests --
 --ignored --nocapture` on an AMD GPU (`AMDh264Encoder`). The test captures
@@ -293,7 +291,7 @@ Baseline), and both the first IDR and a forced one carry SPS/PPS. OpenH264
 decodes every frame. **Still to do before calling phase 3 done:** the same
 test on NVIDIA and Intel, and the two-instance 1440p60 stress test.
 
-### Phase 4: selection, fallback, settings (S)
+### Phase 4: selection, fallback, settings (S) — landed
 
 - `app.rs` encoder thread: try the hardware encoder, and on any error during
   set-up or the first frames, log why and fall back to OpenH264 for the rest
@@ -302,6 +300,33 @@ test on NVIDIA and Intel, and the two-instance 1440p60 stress test.
   persisted alongside resolution and frame rate.
 - Stats panel and diag log show which encoder is running.
 - Raise `MAX_BITRATE` only once phase 0 shows the data channel can carry it.
+
+Landed as `EncoderSelector` in `src/app.rs`, which owns the encoder thread's
+encoder. The `SCREENSHARE_HW_ENCODER` variable is gone. Details:
+
+- **Fallback triggers:** `MfEncoder::new` failing (no hardware encoder,
+  session limit, remote desktop), any `encode` error at any point in the
+  session (not only the first frames; the 2 s stall timeout is the usual
+  one), or no output at all after `HW_FIRST_OUTPUT_WITHIN` (30) frames. Any
+  of these switches to OpenH264 for the rest of the session, including
+  after later resolution changes. On an encode failure the same frame is
+  re-encoded with OpenH264, so no frame is lost. The first OpenH264 frame
+  is an IDR, so the viewer recovers straight away.
+- **Setting:** `EncoderChoice` in `viewer/settings.rs`, carried to the
+  session as `Quality::hardware_encoder`. Settings saved before this change
+  load as Automatic (`#[serde(default)]`). Like resolution and frame rate,
+  it applies from the next session.
+- **Stats panel:** an "Encoder" row under Sending: Hardware, Software, or
+  "Software (fallback)" when Automatic couldn't use the hardware encoder
+  (`SessionStats::encoder`). The encoder's own name goes to the log
+  (`Encoding WxH with <name> (hardware|software)`) and to the diag
+  `encode [<name>]` line, not the panel.
+- **`MAX_BITRATE` stays at 10 Mbit/s.** The phase 0 data channel limit
+  still applies.
+
+Not yet verified by hand: forcing each fallback trigger in a live session,
+and the Settings toggle end to end. Unit tests cover the setting's default
+and migration, and the stats label.
 
 ### Phase 5: receive side (M–L)
 

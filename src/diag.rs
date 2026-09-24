@@ -7,7 +7,7 @@
 //!
 //! Counters are process-global: one process runs one session at a time.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,13 @@ pub static ENC_BLOCKED_US: Counter = Counter::new();
 pub static ENC_READBACKS: Counter = Counter::new();
 pub static ENC_READBACK_US: Counter = Counter::new();
 pub static ENC_READBACK_MAX_US: Counter = Counter::new();
+
+/// Which encoder the encoder thread is using, named in the `encode` line.
+static ENCODER_NAME: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_encoder(name: &str) {
+    *ENCODER_NAME.lock().unwrap() = name.to_string();
+}
 
 // Sender task.
 pub static SND_IN: Counter = Counter::new();
@@ -182,6 +189,8 @@ fn reporter() {
         let gui_up_us = GUI_UPLOAD_US.take();
         let gui_paints = GUI_PAINTS.take();
 
+        let encoder = ENCODER_NAME.lock().unwrap().clone();
+
         let anything = cap_arrived + enc_in + snd_in + rcv_msgs + dec_in + gui_up;
         if anything == 0 {
             continue;
@@ -195,7 +204,7 @@ fn reporter() {
             ms(cap_gpu_max),
         );
         tracing::info!(
-            "pipeline | encode: in {enc_in}, out {enc_out} (idr {enc_idr}), empty {enc_empty}, \
+            "pipeline | encode [{encoder}]: in {enc_in}, out {enc_out} (idr {enc_idr}), empty {enc_empty}, \
              err {enc_err}, nals/frame {:.1}, {:.2} Mbit, max frame {} KB, scale avg {:.1}ms, \
              readbacks {enc_rbs} avg {:.1}ms max {:.1}ms, \
              encode avg {:.1}ms max {:.1}ms, blocked on send queue {:.0}ms",
