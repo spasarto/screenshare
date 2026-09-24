@@ -16,18 +16,24 @@ pub enum CaptureTarget {
 
 /// A frame ready for the encoder: NV12 (BT.709, studio range), already
 /// scaled and colour-converted on the GPU by [`video_processor::VideoProcessor`]
-/// (see `docs/hardware-encoding-plan.md` phase 2). `width`/`height` are the
-/// encode target's dimensions, not the captured surface's.
+/// (see `docs/hardware-encoding-plan.md` phase 2), still in video memory.
+/// `width`/`height` are the encode target's dimensions, not the captured
+/// surface's. The hardware encoder consumes the texture directly; the
+/// software encoder and the preview call [`Frame::read_back`].
 #[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed, `width * height` bytes.
-    pub y: Vec<u8>,
-    /// Tightly packed, interleaved U/V, `width * height / 2` bytes.
-    pub uv: Vec<u8>,
-    #[allow(dead_code)] // Reserved for future A/V sync and pacing decisions.
+    pub surface: video_processor::Nv12Surface,
     pub timestamp: Instant,
+}
+
+impl Frame {
+    /// Copies the frame to the CPU as tightly packed planes: `Y`
+    /// (`width * height` bytes) and interleaved `UV` (`width * height / 2`).
+    pub fn read_back(&self) -> windows::core::Result<(Vec<u8>, Vec<u8>)> {
+        self.surface.read_back(self.width, self.height)
+    }
 }
 
 /// Rounds `v` up to the nearest multiple of 16, never below 16. Hardware

@@ -20,10 +20,59 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
 
-/// Output textures kept in flight. Lets the Blt for one frame start while an
-/// earlier frame's texture is still being read back or (once phase 3 lands)
-/// held by the hardware encoder.
+use crate::diag;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Output textures kept in flight: one being encoded, one waiting in the
+/// encoder queue, and one for the Blt of the frame arriving now.
 const RING_SIZE: usize = 3;
+
+/// One NV12 output texture from a [`VideoProcessor`]'s ring, leased to
+/// whoever holds a clone of this. The ring won't write to the texture again
+/// until every clone is gone, so the encoder thread (and the hardware
+/// encoder MFT, which keeps its own clone until the frame's output comes
+/// out) can read it without the next capture overwriting it.
+#[derive(Clone)]
+pub struct Nv12Surface {
+    texture: ID3D11Texture2D,
+    _lease: Arc<()>,
+}
+
+impl Nv12Surface {
+    pub fn texture(&self) -> &ID3D11Texture2D {
+        &self.texture
+    }
+
+    /// Copies the surface back to the CPU (see [`read_back_nv12`]), for the
+    /// software encoder and the preview thumbnail. The hardware encoder
+    /// never needs this.
+    pub fn read_back(&self, width: u32, height: u32) -> windows::core::Result<(Vec<u8>, Vec<u8>)> {
+        let start = Instant::now();
+        let device = unsafe { self.texture.GetDevice() }?;
+        let context = unsafe { device.GetImmediateContext() }?;
+        let planes = read_back_nv12(&device, &context, &self.texture, width, height)?;
+        let elapsed = start.elapsed();
+        diag::ENC_READBACKS.inc();
+        diag::ENC_READBACK_US.add_time(elapsed);
+        diag::ENC_READBACK_MAX_US.max_time(elapsed);
+        Ok(planes)
+    }
+}
+
+struct RingSlot {
+    texture: ID3D11Texture2D,
+    output_view: ID3D11VideoProcessorOutputView,
+    /// Cloned into every [`Nv12Surface`] handed out for this slot; a strong
+    /// count of 1 means nobody downstream still holds it.
+    lease: Arc<()>,
+}
+
+impl RingSlot {
+    fn is_free(&self) -> bool {
+        Arc::strong_count(&self.lease) == 1
+    }
+}
 
 /// Scales and colour-converts captured BGRA into NV12, entirely on the GPU.
 /// One instance per (input size, output size) pair; recreate when either
@@ -35,7 +84,8 @@ pub struct VideoProcessor {
     processor: ID3D11VideoProcessor,
     input_size: (u32, u32),
     output_size: (u32, u32),
-    ring: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
+    context: ID3D11DeviceContext,
+    ring: Vec<RingSlot>,
     next: usize,
 }
 
@@ -89,7 +139,11 @@ impl VideoProcessor {
         }
 
         let ring = (0..RING_SIZE)
-            .map(|_| create_output_texture(device, &video_device, &enumerator, output_size))
+            .map(|_| {
+                create_output_texture(device, &video_device, &enumerator, output_size).map(
+                    |(texture, output_view)| RingSlot { texture, output_view, lease: Arc::new(()) },
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -99,6 +153,7 @@ impl VideoProcessor {
             processor,
             input_size,
             output_size,
+            context: context.clone(),
             ring,
             next: 0,
         })
@@ -112,10 +167,18 @@ impl VideoProcessor {
         self.output_size
     }
 
-    /// Scales and colour-converts `input` (BGRA) into the next ring texture
-    /// and returns it. The reference is only valid until the next call to
-    /// `convert` cycles the ring back onto the same slot.
-    pub fn convert(&mut self, input: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
+    /// Scales and colour-converts `input` (BGRA) into the next free ring
+    /// texture and returns a lease on it. `None` when every texture is still
+    /// held downstream, meaning the encoder is behind and this frame should
+    /// be dropped.
+    pub fn convert(&mut self, input: &ID3D11Texture2D) -> Result<Option<Nv12Surface>> {
+        let Some(idx) = (0..self.ring.len())
+            .map(|i| (self.next + i) % self.ring.len())
+            .find(|&i| self.ring[i].is_free())
+        else {
+            return Ok(None);
+        };
+
         let view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -135,9 +198,8 @@ impl VideoProcessor {
         .context("CreateVideoProcessorInputView failed")?;
         let input_view = input_view.context("CreateVideoProcessorInputView produced no view")?;
 
-        let idx = self.next;
-        self.next = (self.next + 1) % self.ring.len();
-        let (texture, output_view) = &self.ring[idx];
+        self.next = (idx + 1) % self.ring.len();
+        let slot = &self.ring[idx];
 
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
@@ -147,7 +209,7 @@ impl VideoProcessor {
         let blt_result = unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
-                output_view,
+                &slot.output_view,
                 0,
                 std::slice::from_ref(&stream),
             )
@@ -157,8 +219,11 @@ impl VideoProcessor {
         // it ourselves so the input view's COM reference isn't leaked.
         let _ = unsafe { core::mem::ManuallyDrop::take(&mut stream.pInputSurface) };
         blt_result.context("VideoProcessorBlt failed")?;
+        // Hand the Blt to the GPU now rather than whenever the context next
+        // fills up: the encoder thread is about to wait on its result.
+        unsafe { self.context.Flush() };
 
-        Ok(texture)
+        Ok(Some(Nv12Surface { texture: slot.texture.clone(), _lease: slot.lease.clone() }))
     }
 }
 
@@ -229,7 +294,7 @@ fn create_output_texture(
 /// (`width * height` bytes) and interleaved `UV` (`width * height / 2`
 /// bytes). Named same as the BGRA readback it replaces, but ~6x smaller at
 /// the same resolution since there's no colour data to duplicate 4x over.
-pub fn read_back_nv12(
+fn read_back_nv12(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,

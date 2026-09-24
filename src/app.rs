@@ -1,6 +1,6 @@
 use crate::capture;
 use crate::capture::CaptureTarget;
-use crate::codec::{H264Decoder, H264Encoder};
+use crate::codec::{H264Decoder, H264Encoder, MfEncoder, VideoEncoder};
 use crate::diag;
 use crate::failure::{SessionFailure, Step};
 use crate::signaling_server::SignalingServer;
@@ -35,6 +35,17 @@ const BYE_LINGER: Duration = Duration::from_millis(50);
 const PREVIEW_MAX_WIDTH: u32 = 240;
 const PREVIEW_MAX_HEIGHT: u32 = 136;
 const PREVIEW_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a viewer that joins or loses data mid-stream waits, at most, for
+/// a picture it can decode from. Timed rather than counted in frames: the
+/// capture only delivers frames when the screen changes, so a frame count
+/// meant for 60 fps could stretch to tens of seconds on a quiet screen.
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Opts in to the Media Foundation hardware encoder (any value but "0").
+/// Until the fallback and the setting from phase 4 of
+/// `docs/hardware-encoding-plan.md` land, OpenH264 stays the default.
+const HW_ENCODER_ENV: &str = "SCREENSHARE_HW_ENCODER";
 
 /// Wakes the GUI. The decoder calls it whenever a frame lands, so the viewer
 /// repaints on arrival instead of polling at a fixed rate.
@@ -589,26 +600,28 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
     std::thread::Builder::new()
         .name("encoder".into())
         .spawn(move || {
-            let mut encoder: Option<H264Encoder> = None;
+            let mut encoder: Option<Box<dyn VideoEncoder>> = None;
             let mut last_preview: Option<Instant> = None;
+            let mut last_keyframe: Option<Instant> = None;
 
             while let Ok(frame) = capture_rx.recv() {
                 diag::ENC_IN.inc();
                 let (w, h) = (frame.width, frame.height);
 
-                if encoder.is_none()
-                    || encoder
-                        .as_ref()
-                        .is_some_and(|e| e.width() != w || e.height() != h)
-                {
-                    tracing::info!("Creating encoder for {w}x{h}");
-                    match H264Encoder::new(w, h, quality.fps) {
+                if encoder.as_ref().is_none_or(|e| e.size() != (w, h)) {
+                    // Release the old encoder (and any frames it holds)
+                    // before starting a new one: hardware encoders have a
+                    // session limit.
+                    encoder = None;
+                    match create_encoder(&frame, quality.fps) {
                         Ok(e) => {
+                            tracing::info!("Encoding {w}x{h} with {}", e.name());
                             encoder = Some(e);
+                            last_keyframe = None;
                             encoder_stats.set_local_size(w, h);
                         }
                         Err(e) => {
-                            tracing::error!("Failed to create encoder: {e}");
+                            tracing::error!("Failed to create encoder: {e:#}");
                             continue;
                         }
                     }
@@ -616,13 +629,20 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
 
                 if last_preview.is_none_or(|t| t.elapsed() >= PREVIEW_INTERVAL) {
                     last_preview = Some(Instant::now());
-                    *outgoing_preview.lock().unwrap() = Some(preview_frame(&frame.y, &frame.uv, w, h));
+                    match frame.read_back() {
+                        Ok((y, uv)) => *outgoing_preview.lock().unwrap() = Some(preview_frame(&y, &uv, w, h)),
+                        Err(e) => tracing::debug!("Preview readback failed: {e}"),
+                    }
                 }
 
                 let enc = encoder.as_mut().unwrap();
+                if last_keyframe.is_some_and(|t| t.elapsed() >= KEYFRAME_INTERVAL) {
+                    enc.force_keyframe();
+                }
 
                 let encode_start = Instant::now();
-                let result = enc.encode(&frame.y, &frame.uv);
+                let result = enc.encode(&frame);
+                drop(frame);
                 let encode_time = encode_start.elapsed();
                 diag::ENC_ENCODE_US.add_time(encode_time);
                 diag::ENC_ENCODE_MAX_US.max_time(encode_time);
@@ -636,6 +656,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
                             diag::ENC_MAX_BYTES.max(h264_data.len() as u64);
                             if diag::has_idr(&h264_data) {
                                 diag::ENC_IDR.inc();
+                                last_keyframe = Some(Instant::now());
                                 tracing::debug!("Keyframe: {} KB", h264_data.len() / 1024);
                             }
                             let send_start = Instant::now();
@@ -645,7 +666,7 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
                     }
                     Err(e) => {
                         diag::ENC_ERR.inc();
-                        tracing::warn!("Encode error: {e}");
+                        tracing::warn!("Encode error: {e:#}");
                     }
                 }
             }
@@ -740,6 +761,20 @@ fn start_media_threads(threads: MediaThreads) -> Result<capture::session::Captur
     // running with nothing to stop it.
     capture::session::start_capture(target, capture_tx, paused, quality.fps, quality.max_width, quality.max_height)
         .context(Step::Capture)
+}
+
+/// The Media Foundation hardware encoder when opted in to (see
+/// `HW_ENCODER_ENV`) and one will start on the capture adapter, OpenH264
+/// otherwise.
+fn create_encoder(frame: &capture::Frame, fps: u32) -> Result<Box<dyn VideoEncoder>> {
+    let (w, h) = (frame.width, frame.height);
+    if std::env::var(HW_ENCODER_ENV).is_ok_and(|v| v != "0") {
+        match MfEncoder::new(frame.surface.texture(), w, h, fps) {
+            Ok(e) => return Ok(Box::new(e)),
+            Err(e) => tracing::warn!("Hardware encoder unavailable, using OpenH264: {e:#}"),
+        }
+    }
+    Ok(Box::new(H264Encoder::new(w, h, fps)?))
 }
 
 /// Shrinks an encoder-input frame (NV12) to the RGBA still the viewer shows

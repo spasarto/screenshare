@@ -1,7 +1,7 @@
 # Hardware video encoding plan
 
 Date: 2026-09-18
-Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phases 3+ not started.
+Status: **Draft.** Phase 0 done (2026-09-19). Phase 1 done (2026-09-19). Phase 2 done (2026-09-19). Phase 3 landed (2026-09-23), verified on AMD only. Phases 4+ not started.
 
 ## Why
 
@@ -185,7 +185,7 @@ real `H264Encoder` (`cargo test --bin screenshare capture::session::tests --
 --ignored`). Not yet re-run: the two-local-instances stress test from phase 0
 to confirm the expected latency drop end to end.
 
-### Phase 3: Media Foundation hardware encoder (L)
+### Phase 3: Media Foundation hardware encoder (L) — landed, AMD verified
 
 New `codec/mf_encoder.rs`, behind a small trait shared with OpenH264:
 
@@ -235,6 +235,63 @@ Output:
   (`MF_MT_MPEG_SEQUENCE_HEADER` on the output type), cache them and prepend
   to each IDR ourselves. Check with `diag::has_idr` plus a NAL type 7/8 scan.
 - Resolution change: tear down and re-create, as the OpenH264 path does now.
+
+Landed as `src/codec/mf_encoder.rs` (`MfEncoder`), with the trait in
+`src/codec/mod.rs`. Differences from the plan above:
+
+- **`EncoderInput` is `capture::Frame`, always a GPU texture.** There's no
+  CPU-planes variant: nothing produces CPU frames today (the capture always
+  runs through the video processor). The frame carries an `Nv12Surface`, a
+  lease on one of the video processor's 3 ring textures; the ring skips a
+  texture while any clone of its lease is alive and drops the frame
+  (`drop_queue_full`) if all 3 are held. `MfEncoder` keeps a clone of each
+  frame until its output comes out, so the capture thread can't overwrite a
+  texture the encoder is still reading. OpenH264 (`H264Encoder`, now also a
+  `VideoEncoder`) calls `Frame::read_back` itself, so the NV12 readback moved
+  from the capture thread to the encoder thread and is skipped entirely on
+  the hardware path. Its diag counters moved with it (`readbacks` in the
+  `encode` line); the preview still reads back once a second.
+- **The trait isn't `Send`** and has a `size()` method. Encoders are
+  created and used on the encoder thread only.
+- **The 2 s keyframe timer moved to `app.rs`**, which calls
+  `force_keyframe()` on either encoder once 2 s pass without an IDR in the
+  output. `CODECAPI_AVEncMPVGOPSize` is `fps * 4`, a backstop for an encoder
+  that ignores forced keyframes, rather than "large".
+- **Enumeration:** `MFTEnum2` filtered by `MFT_ENUM_ADAPTER_LUID` (the capture
+  texture's adapter), falling back to `MFTEnumEx`. Every candidate is tried
+  in order, not just the first, so one hitting a session limit falls through
+  to the next.
+- **Event handling:** a small `mf-events` thread blocks on `GetEvent` and
+  forwards events over a channel, so `encode` waits with timeouts (2 s
+  stall → error). `encode` submits one frame and waits for its output. If
+  the MFT asks for more input while still owing output for 250 ms, the
+  encoder is treated as buffering frames and `encode` stops waiting for
+  that many frames of lag from then on. Teardown sends end-of-stream, then
+  `IMFShutdown::Shutdown` to wake and end the pump thread.
+- **Rate control:** CBR only. Low-delay VBR hasn't been tried.
+- **Profile:** asks for Constrained Baseline, falling back to Baseline if the
+  output type is refused. Level is the lowest that fits the size and rate
+  (`h264_level`). VUI is BT.709 primaries, transfer and matrix, studio range,
+  matching the video processor's output.
+- **SPS/PPS:** cached whenever the encoder emits them, and prepended to any
+  IDR that comes without them (falling back to `MF_MT_MPEG_SEQUENCE_HEADER`).
+- **Not done: the `MF_MT_MINIMUM_DISPLAY_APERTURE` crop.** It's still deferred
+  from phase 2. The video processor still stretches into the ≤15 px of
+  16-alignment padding, because OpenH264 (the fallback) has no cropping to
+  match.
+- **Selection is opt-in for now:** set `SCREENSHARE_HW_ENCODER=1` to use the
+  hardware encoder. If it fails to create, the app logs why and uses
+  OpenH264. Errors during encoding are not yet a fallback trigger; phase 4
+  makes Automatic the default and adds that.
+
+Verified with `cargo test --bin screenshare codec::mf_encoder::tests --
+--ignored --nocapture` on an AMD GPU (`AMDh264Encoder`). The test captures
+the primary monitor at a 1920×1080 target and encodes 60 frames at
+**~4–6 ms each (first keyframe 8 ms)**, compared with 100–150 ms for
+OpenH264. The SPS reports profile_idc 66 with constraint_set1 (Constrained
+Baseline), and both the first IDR and a forced one carry SPS/PPS. OpenH264
+decodes every frame. **Still to do before calling phase 3 done:** the same
+test on NVIDIA and Intel, and the two-instance 1440p60 stress test.
 
 ### Phase 4: selection, fallback, settings (S)
 

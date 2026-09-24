@@ -9,10 +9,11 @@
 //!
 //! Each captured BGRA frame is scaled and colour-converted to NV12 by
 //! [`super::video_processor::VideoProcessor`] before it ever leaves this
-//! thread (phase 2 of `docs/hardware-encoding-plan.md`), so only a small
-//! NV12 surface needs a CPU readback, not the full-size BGRA capture.
+//! thread (phase 2 of `docs/hardware-encoding-plan.md`), and handed on still
+//! in video memory: the hardware encoder reads it there, and only the
+//! software fallback reads the (small) NV12 surface back to the CPU.
 
-use super::video_processor::{self, VideoProcessor};
+use super::video_processor::VideoProcessor;
 use super::{CaptureTarget, Frame};
 use crate::diag;
 use anyhow::{Context as _, Result};
@@ -250,7 +251,7 @@ fn setup_capture(
                 return Ok(());
             }
 
-            // Paused: drop the frame before paying for the GPU readback, so
+            // Paused: drop the frame before paying for the GPU work, so
             // nothing reaches the encoder and it goes idle.
             if closure_paused.load(Ordering::Relaxed) {
                 diag::CAP_SKIP_PAUSED.inc();
@@ -259,7 +260,7 @@ fn setup_capture(
 
             // Frame-rate cap, applied here rather than relying solely on
             // WGC's MinUpdateInterval, which older Windows 10 builds don't
-            // have. Also before the readback, so a dropped frame costs
+            // have. Also before the GPU work, so a dropped frame costs
             // nothing.
             let now = Instant::now();
             {
@@ -295,8 +296,13 @@ fn setup_capture(
             let vp = vp_guard.as_mut().unwrap();
 
             let gpu_start = Instant::now();
-            let nv12_texture = match vp.convert(&texture) {
-                Ok(t) => t,
+            let surface = match vp.convert(&texture) {
+                Ok(Some(surface)) => surface,
+                Ok(None) => {
+                    // Every NV12 texture is still held by the encoder.
+                    diag::CAP_DROP_FULL.inc();
+                    return Ok(());
+                }
                 Err(e) => {
                     tracing::warn!("GPU scale/colour-convert failed: {e:#}");
                     return Ok(());
@@ -306,29 +312,10 @@ fn setup_capture(
             diag::CAP_GPU_US.add_time(gpu_time);
             diag::CAP_GPU_MAX_US.max_time(gpu_time);
 
-            let readback_start = Instant::now();
-            let (y, uv) = match video_processor::read_back_nv12(
-                &closure_device,
-                &closure_context,
-                nv12_texture,
-                output_size.0,
-                output_size.1,
-            ) {
-                Ok(planes) => planes,
-                Err(e) => {
-                    tracing::warn!("NV12 readback failed: {e}");
-                    return Ok(());
-                }
-            };
-            let readback = readback_start.elapsed();
-            diag::CAP_READBACK_US.add_time(readback);
-            diag::CAP_READBACK_MAX_US.max_time(readback);
-
             let frame = Frame {
                 width: output_size.0,
                 height: output_size.1,
-                y,
-                uv,
+                surface,
                 timestamp: Instant::now(),
             };
 
@@ -470,7 +457,7 @@ mod tests {
     use super::*;
 
     /// Captures the primary monitor for real and checks that frames with
-    /// sane BGRA8 dimensions come out the other end. Needs an interactive
+    /// sane NV12 dimensions come out the other end. Needs an interactive
     /// desktop session, so it's not part of the default `cargo test` run:
     /// `cargo test --package screenshare --lib capture::session::tests -- --ignored`.
     #[test]
@@ -491,24 +478,16 @@ mod tests {
             assert!(frame.width > 0 && frame.height > 0, "frame has zero dimension");
             assert_eq!(frame.width % 16, 0, "frame width isn't 16-aligned");
             assert_eq!(frame.height % 16, 0, "frame height isn't 16-aligned");
-            assert_eq!(
-                frame.y.len(),
-                (frame.width * frame.height) as usize,
-                "Y plane isn't tightly packed"
-            );
-            assert_eq!(
-                frame.uv.len(),
-                (frame.width * frame.height / 2) as usize,
-                "UV plane isn't tightly packed"
-            );
+            let (y, uv) = frame.read_back().expect("NV12 readback should succeed");
+            assert_eq!(y.len(), (frame.width * frame.height) as usize, "Y plane isn't tightly packed");
+            assert_eq!(uv.len(), (frame.width * frame.height / 2) as usize, "UV plane isn't tightly packed");
 
             // The whole point of the GPU video processor (phase 2) is to
             // feed the encoder directly; make sure what comes out the other
             // end is actually valid encoder input, not just correctly shaped.
             let mut encoder = crate::codec::H264Encoder::new(frame.width, frame.height, 30)
                 .expect("encoder should accept the video processor's NV12 output");
-            let encoded = encoder
-                .encode(&frame.y, &frame.uv)
+            let encoded = crate::codec::VideoEncoder::encode(&mut encoder, &frame)
                 .expect("encoding a real captured frame should succeed");
             assert!(!encoded.is_empty(), "first frame should encode to a keyframe");
 
