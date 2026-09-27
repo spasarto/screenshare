@@ -60,7 +60,6 @@ pub static CAP_GPU_MAX_US: Counter = Counter::new();
 
 // Encoder thread.
 pub static ENC_IN: Counter = Counter::new();
-pub static ENC_SCALE_US: Counter = Counter::new();
 pub static ENC_ENCODE_US: Counter = Counter::new();
 pub static ENC_ENCODE_MAX_US: Counter = Counter::new();
 pub static ENC_OUT: Counter = Counter::new();
@@ -158,7 +157,6 @@ fn reporter() {
         let cap_gpu_max = CAP_GPU_MAX_US.take();
 
         let enc_in = ENC_IN.take();
-        let enc_scale = ENC_SCALE_US.take();
         let enc_us = ENC_ENCODE_US.take();
         let enc_max = ENC_ENCODE_MAX_US.take();
         let enc_out = ENC_OUT.take();
@@ -215,13 +213,12 @@ fn reporter() {
         );
         tracing::info!(
             "pipeline | encode [{encoder}]: in {enc_in}, out {enc_out} (idr {enc_idr}), empty {enc_empty}, \
-             err {enc_err}, nals/frame {:.1}, {:.2} Mbit, max frame {} KB, scale avg {:.1}ms, \
+             err {enc_err}, nals/frame {:.1}, {:.2} Mbit, max frame {} KB, \
              readbacks {enc_rbs} avg {:.1}ms max {:.1}ms, \
              encode avg {:.1}ms max {:.1}ms, blocked on send queue {:.0}ms",
             if enc_out == 0 { 0.0 } else { enc_nals as f64 / enc_out as f64 },
             enc_bytes as f64 * 8.0 / 1e6 / secs,
             enc_max_bytes / 1024,
-            avg_ms(enc_scale, enc_in),
             avg_ms(enc_rb, enc_rbs),
             ms(enc_rb_max),
             avg_ms(enc_us, enc_in),

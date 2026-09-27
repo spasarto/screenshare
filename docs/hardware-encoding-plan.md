@@ -407,12 +407,40 @@ Verified on an AMD GPU (RX 7900 XTX):
 decoder fallback in a live session, and checking colours by eye in the
 running app (only the unit test checks them).
 
-### Phase 6: follow-ups (S each)
+### Phase 6: follow-ups (S each) — landed
 
 - A 4K / "native" resolution option once 1440p60 holds.
 - Use `GraphicsCaptureFrame` dirty regions to skip encoding unchanged frames.
 - Remove `diag` counters that are no longer useful, or keep them as a
   debug-only feature.
+
+What happened to each:
+
+- **4K resolution option: added.** Settings → Resolution now has a "4K"
+  choice (`Resolution::P2160`, up to 3840×2160). There's no "native"
+  option: sources larger than 4K would need a level above 5.2, which
+  OpenH264 can't decode. `MAX_BITRATE` stays at 10 Mbit/s. At 4K60 that's
+  below `bitrate_for`'s budget, but screen content is mostly static.
+  Checked on the AMD GPU by running the phase 3 and phase 5 tests at a
+  3840×2160, 60 fps target: the hardware encoder took **~8 ms a frame**
+  (Constrained Baseline SPS, IDRs carry SPS/PPS) and the DXVA decoder
+  7–12 ms (debug build). Software only at 4K will be far too slow for
+  60 fps. The 1440p60 stress test that was meant to gate this option still
+  hasn't been run.
+- **Dirty regions: tried and dropped.** `Direct3D11CaptureFrame::DirtyRegions`
+  works on this machine (Windows 11 25H2). But in a live test, WGC never
+  delivered a frame with an empty dirty-region list: it only fires
+  `FrameArrived` when something in the target actually changed. A static
+  Settings window produced one frame in 6 s. Cursor movement is reported as
+  small (~32 px) dirty rectangles, so it counts as a change too. A skip on
+  "no dirty regions" would never trigger, so none was added. The
+  regions could still drive encoder ROI or partial-update hints later, but
+  that's a different feature.
+- **`diag` counters: pruned.** `ENC_SCALE_US` (always 0 since phase 2 moved
+  scaling onto the GPU) and the `scale avg` field of the `encode` line are
+  gone. All the other counters still report something useful, and the
+  reporter only logs while a stage is active, so they stay on in every
+  build rather than moving behind a debug-only feature.
 
 ## Risks and open questions
 

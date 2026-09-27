@@ -16,16 +16,18 @@ pub enum Resolution {
     P720,
     P1080,
     P1440,
+    P2160,
 }
 
 impl Resolution {
-    const ALL: [Resolution; 3] = [Resolution::P720, Resolution::P1080, Resolution::P1440];
+    const ALL: [Resolution; 4] = [Resolution::P720, Resolution::P1080, Resolution::P1440, Resolution::P2160];
 
     fn label(self) -> &'static str {
         match self {
             Resolution::P720 => "720p",
             Resolution::P1080 => "1080p",
             Resolution::P1440 => "1440p",
+            Resolution::P2160 => "4K",
         }
     }
 
@@ -34,6 +36,9 @@ impl Resolution {
             Resolution::P720 => (1280, 720),
             Resolution::P1080 => (1920, 1080),
             Resolution::P1440 => (2560, 1440),
+            // H.264 level 5.2 (OpenH264's highest) tops out just above this
+            // at 60 fps.
+            Resolution::P2160 => (3840, 2160),
         }
     }
 }
@@ -336,6 +341,13 @@ mod tests {
     fn default_quality_matches_the_old_hard_coded_capture() {
         let q = Settings::default().quality();
         assert_eq!((q.max_width, q.max_height, q.fps), (1280, 720, 30));
+    }
+
+    #[test]
+    fn four_k_is_3840_by_2160() {
+        let s: Settings = serde_json::from_str(r#"{"resolution":"P2160"}"#).unwrap();
+        let q = s.quality();
+        assert_eq!((q.max_width, q.max_height), (3840, 2160));
     }
 
     #[test]
