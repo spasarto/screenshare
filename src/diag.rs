@@ -7,7 +7,7 @@
 //!
 //! Counters are process-global: one process runs one session at a time.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -52,12 +52,14 @@ pub static CAP_SKIP_PAUSED: Counter = Counter::new();
 pub static CAP_SKIP_RATE: Counter = Counter::new();
 pub static CAP_KEPT: Counter = Counter::new();
 pub static CAP_DROP_FULL: Counter = Counter::new();
-pub static CAP_READBACK_US: Counter = Counter::new();
-pub static CAP_READBACK_MAX_US: Counter = Counter::new();
+/// Time spent in the GPU video processor's scale + BGRA→NV12 Blt (phase 2 of
+/// docs/hardware-encoding-plan.md). The frame stays on the GPU afterwards;
+/// any CPU readback is counted on the encoder side (`ENC_READBACK_*`).
+pub static CAP_GPU_US: Counter = Counter::new();
+pub static CAP_GPU_MAX_US: Counter = Counter::new();
 
 // Encoder thread.
 pub static ENC_IN: Counter = Counter::new();
-pub static ENC_SCALE_US: Counter = Counter::new();
 pub static ENC_ENCODE_US: Counter = Counter::new();
 pub static ENC_ENCODE_MAX_US: Counter = Counter::new();
 pub static ENC_OUT: Counter = Counter::new();
@@ -70,6 +72,26 @@ pub static ENC_IDR: Counter = Counter::new();
 /// frame was split into slices the encoder could spread over threads.
 pub static ENC_NALS: Counter = Counter::new();
 pub static ENC_BLOCKED_US: Counter = Counter::new();
+/// NV12 GPU → CPU copies: every frame for the software encoder, once a
+/// second for the preview, never for the hardware encoder's frames.
+pub static ENC_READBACKS: Counter = Counter::new();
+pub static ENC_READBACK_US: Counter = Counter::new();
+pub static ENC_READBACK_MAX_US: Counter = Counter::new();
+
+/// Which encoder the encoder thread is using, named in the `encode` line.
+static ENCODER_NAME: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_encoder(name: &str) {
+    *ENCODER_NAME.lock().unwrap() = name.to_string();
+}
+
+/// Which decoder the decoder thread is using, named in the `decode` part of
+/// the `receive` line.
+static DECODER_NAME: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_decoder(name: &str) {
+    *DECODER_NAME.lock().unwrap() = name.to_string();
+}
 
 // Sender task.
 pub static SND_IN: Counter = Counter::new();
@@ -92,7 +114,8 @@ pub static DEC_NONE: Counter = Counter::new();
 pub static DEC_ERR: Counter = Counter::new();
 pub static DEC_US: Counter = Counter::new();
 pub static DEC_MAX_US: Counter = Counter::new();
-/// A decoded frame replaced one the GUI never picked up.
+/// A decoded frame replaced one the GUI never picked up, or the decoder
+/// produced several at once and only the newest was kept.
 pub static DEC_OVERWRITTEN: Counter = Counter::new();
 
 // GUI thread.
@@ -130,11 +153,10 @@ fn reporter() {
         let cap_rate = CAP_SKIP_RATE.take();
         let cap_kept = CAP_KEPT.take();
         let cap_full = CAP_DROP_FULL.take();
-        let cap_rb = CAP_READBACK_US.take();
-        let cap_rb_max = CAP_READBACK_MAX_US.take();
+        let cap_gpu = CAP_GPU_US.take();
+        let cap_gpu_max = CAP_GPU_MAX_US.take();
 
         let enc_in = ENC_IN.take();
-        let enc_scale = ENC_SCALE_US.take();
         let enc_us = ENC_ENCODE_US.take();
         let enc_max = ENC_ENCODE_MAX_US.take();
         let enc_out = ENC_OUT.take();
@@ -145,6 +167,9 @@ fn reporter() {
         let enc_idr = ENC_IDR.take();
         let enc_nals = ENC_NALS.take();
         let enc_blocked = ENC_BLOCKED_US.take();
+        let enc_rbs = ENC_READBACKS.take();
+        let enc_rb = ENC_READBACK_US.take();
+        let enc_rb_max = ENC_READBACK_MAX_US.take();
 
         let snd_in = SND_IN.take();
         let snd_state = SND_DROP_STATE.take();
@@ -171,6 +196,9 @@ fn reporter() {
         let gui_up_us = GUI_UPLOAD_US.take();
         let gui_paints = GUI_PAINTS.take();
 
+        let encoder = ENCODER_NAME.lock().unwrap().clone();
+        let decoder = DECODER_NAME.lock().unwrap().clone();
+
         let anything = cap_arrived + enc_in + snd_in + rcv_msgs + dec_in + gui_up;
         if anything == 0 {
             continue;
@@ -179,18 +207,20 @@ fn reporter() {
         tracing::info!(
             "pipeline {secs:.2}s | capture: arrived {cap_arrived}, kept {cap_kept}, \
              skip_rate {cap_rate}, skip_paused {cap_paused}, drop_queue_full {cap_full}, \
-             readback avg {:.1}ms max {:.1}ms",
-            avg_ms(cap_rb, cap_kept + cap_full),
-            ms(cap_rb_max),
+             gpu scale avg {:.1}ms max {:.1}ms",
+            avg_ms(cap_gpu, cap_kept + cap_full),
+            ms(cap_gpu_max),
         );
         tracing::info!(
-            "pipeline | encode: in {enc_in}, out {enc_out} (idr {enc_idr}), empty {enc_empty}, \
-             err {enc_err}, nals/frame {:.1}, {:.2} Mbit, max frame {} KB, scale avg {:.1}ms, \
+            "pipeline | encode [{encoder}]: in {enc_in}, out {enc_out} (idr {enc_idr}), empty {enc_empty}, \
+             err {enc_err}, nals/frame {:.1}, {:.2} Mbit, max frame {} KB, \
+             readbacks {enc_rbs} avg {:.1}ms max {:.1}ms, \
              encode avg {:.1}ms max {:.1}ms, blocked on send queue {:.0}ms",
             if enc_out == 0 { 0.0 } else { enc_nals as f64 / enc_out as f64 },
             enc_bytes as f64 * 8.0 / 1e6 / secs,
             enc_max_bytes / 1024,
-            avg_ms(enc_scale, enc_in),
+            avg_ms(enc_rb, enc_rbs),
+            ms(enc_rb_max),
             avg_ms(enc_us, enc_in),
             ms(enc_max),
             ms(enc_blocked),
@@ -205,7 +235,7 @@ fn reporter() {
         );
         tracing::info!(
             "pipeline | receive: msgs {rcv_msgs}, {:.2} Mbit, queue wait {:.0}ms | \
-             decode: in {dec_in}, frames {dec_frame}, none {dec_none}, err {dec_err}, \
+             decode [{decoder}]: in {dec_in}, frames {dec_frame}, none {dec_none}, err {dec_err}, \
              avg {:.1}ms max {:.1}ms, overwritten before display {dec_over} | \
              gui: paints {gui_paints}, uploads {gui_up}, upload avg {:.1}ms",
             rcv_bytes as f64 * 8.0 / 1e6 / secs,

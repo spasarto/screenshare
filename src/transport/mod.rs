@@ -129,6 +129,16 @@ impl SharedConnState {
     }
 }
 
+/// The kind of encoder a session is sending with, or decoder it's receiving
+/// with, for the stats panel. Its name ("AMDh264Encoder", "OpenH264", ...)
+/// goes to the log instead.
+#[derive(Clone, Copy, Debug)]
+pub struct CodecInfo {
+    pub hardware: bool,
+    /// The hardware codec was allowed but didn't start, or failed mid-session.
+    pub fell_back: bool,
+}
+
 /// Running totals for one session, bumped by the media threads and sampled
 /// by the viewer's stats panel, which turns them into rates.
 ///
@@ -147,6 +157,8 @@ pub struct SessionStats {
     local_size: AtomicU64,
     /// Latest in-band ping round trip, in microseconds. 0 until measured.
     rtt_micros: AtomicU64,
+    encoder: Mutex<Option<CodecInfo>>,
+    decoder: Mutex<Option<CodecInfo>>,
 }
 
 impl SessionStats {
@@ -180,6 +192,22 @@ impl SessionStats {
         // Never store 0: that value means "not measured yet".
         let micros = (rtt.as_micros() as u64).max(1);
         self.rtt_micros.store(micros, Ordering::Relaxed);
+    }
+
+    pub fn set_encoder(&self, info: CodecInfo) {
+        *self.encoder.lock().unwrap() = Some(info);
+    }
+
+    pub fn encoder(&self) -> Option<CodecInfo> {
+        *self.encoder.lock().unwrap()
+    }
+
+    pub fn set_decoder(&self, info: CodecInfo) {
+        *self.decoder.lock().unwrap() = Some(info);
+    }
+
+    pub fn decoder(&self) -> Option<CodecInfo> {
+        *self.decoder.lock().unwrap()
     }
 
     pub fn rtt(&self) -> Option<std::time::Duration> {

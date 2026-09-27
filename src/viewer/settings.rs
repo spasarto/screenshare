@@ -16,16 +16,18 @@ pub enum Resolution {
     P720,
     P1080,
     P1440,
+    P2160,
 }
 
 impl Resolution {
-    const ALL: [Resolution; 3] = [Resolution::P720, Resolution::P1080, Resolution::P1440];
+    const ALL: [Resolution; 4] = [Resolution::P720, Resolution::P1080, Resolution::P1440, Resolution::P2160];
 
     fn label(self) -> &'static str {
         match self {
             Resolution::P720 => "720p",
             Resolution::P1080 => "1080p",
             Resolution::P1440 => "1440p",
+            Resolution::P2160 => "4K",
         }
     }
 
@@ -34,6 +36,9 @@ impl Resolution {
             Resolution::P720 => (1280, 720),
             Resolution::P1080 => (1920, 1080),
             Resolution::P1440 => (2560, 1440),
+            // H.264 level 5.2 (OpenH264's highest) tops out just above this
+            // at 60 fps.
+            Resolution::P2160 => (3840, 2160),
         }
     }
 }
@@ -53,6 +58,28 @@ impl FrameRate {
             FrameRate::Fps15 => 15,
             FrameRate::Fps30 => 30,
             FrameRate::Fps60 => 60,
+        }
+    }
+}
+
+/// Which H.264 encoder and decoder a session uses. Automatic tries the GPU
+/// (the hardware encoder; Media Foundation's decoder, on DXVA where it can)
+/// and falls back to OpenH264 if they won't start or fail; see phases 4 and
+/// 5 of `docs/hardware-encoding-plan.md`. Stored as `encoder`, its name from
+/// before it covered decoding too.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EncoderChoice {
+    Automatic,
+    SoftwareOnly,
+}
+
+impl EncoderChoice {
+    const ALL: [EncoderChoice; 2] = [EncoderChoice::Automatic, EncoderChoice::SoftwareOnly];
+
+    fn label(self) -> &'static str {
+        match self {
+            EncoderChoice::Automatic => "Automatic",
+            EncoderChoice::SoftwareOnly => "Software only",
         }
     }
 }
@@ -89,6 +116,7 @@ impl ThemeChoice {
 pub struct Settings {
     pub resolution: Resolution,
     pub frame_rate: FrameRate,
+    pub encoder: EncoderChoice,
     pub theme: ThemeChoice,
     pub start_minimized: bool,
     /// Empty means [`DEFAULT_SERVER_URL`], so a user who never touches it
@@ -101,6 +129,7 @@ impl Default for Settings {
         Self {
             resolution: Resolution::P720,
             frame_rate: FrameRate::Fps30,
+            encoder: EncoderChoice::Automatic,
             theme: ThemeChoice::System,
             start_minimized: false,
             server_url: String::new(),
@@ -124,6 +153,7 @@ impl Settings {
             max_width,
             max_height,
             fps: self.frame_rate.fps(),
+            hardware_video: self.encoder == EncoderChoice::Automatic,
         }
     }
 }
@@ -203,7 +233,21 @@ impl SettingsPanel {
                         }
                     });
                     ui.end_row();
+
+                    ui.label("Video codec");
+                    ui.horizontal(|ui| {
+                        for e in EncoderChoice::ALL {
+                            if widgets::toggle_button(ui, draft.encoder == e, e.label()).clicked() {
+                                draft.encoder = e;
+                            }
+                        }
+                    });
+                    ui.end_row();
                 });
+            ui.colored_label(
+                p.ink_3,
+                "Automatic encodes and decodes on your graphics card when it can, and falls back to software if it can't.",
+            );
 
             ui.add_space(theme::space::LG);
             widgets::section_header(ui, "Appearance");
@@ -297,5 +341,28 @@ mod tests {
     fn default_quality_matches_the_old_hard_coded_capture() {
         let q = Settings::default().quality();
         assert_eq!((q.max_width, q.max_height, q.fps), (1280, 720, 30));
+    }
+
+    #[test]
+    fn four_k_is_3840_by_2160() {
+        let s: Settings = serde_json::from_str(r#"{"resolution":"P2160"}"#).unwrap();
+        let q = s.quality();
+        assert_eq!((q.max_width, q.max_height), (3840, 2160));
+    }
+
+    #[test]
+    fn hardware_video_is_on_unless_software_only() {
+        assert!(Settings::default().quality().hardware_video);
+        let s = Settings {
+            encoder: EncoderChoice::SoftwareOnly,
+            ..Settings::default()
+        };
+        assert!(!s.quality().hardware_video);
+    }
+
+    #[test]
+    fn settings_saved_before_the_encoder_choice_default_to_automatic() {
+        let s: Settings = serde_json::from_str(r#"{"resolution":"P1080","frame_rate":"Fps60"}"#).unwrap();
+        assert!(s.encoder == EncoderChoice::Automatic);
     }
 }

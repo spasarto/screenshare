@@ -7,6 +7,7 @@ mod diag;
 mod failure;
 mod logging;
 mod signaling_server;
+mod synthetic_load;
 mod transport;
 mod viewer;
 
@@ -39,6 +40,21 @@ pub struct CliArgs {
     /// generating one. Client: connect to this pin.
     #[arg(long)]
     pub pin: Option<String>,
+
+    /// Debug: skip capture and the encoder, sending fixed-size synthetic
+    /// frames at a fixed rate instead, to measure what the data channel can
+    /// sustain independent of encode cost (docs/hardware-encoding-plan.md
+    /// phase 0). Requires --server or --client and --synthetic-fps.
+    #[arg(long, requires = "synthetic_fps")]
+    pub synthetic_kb: Option<u32>,
+
+    /// Frame rate for --synthetic-kb.
+    #[arg(long, requires = "synthetic_kb")]
+    pub synthetic_fps: Option<u32>,
+
+    /// How long to run the --synthetic-kb throughput check, in seconds.
+    #[arg(long, default_value_t = 30, requires = "synthetic_kb")]
+    pub synthetic_secs: u64,
 }
 
 /// A valid session pin is 6 ASCII digits followed by 4 lowercase ASCII letters,
@@ -82,6 +98,21 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "--client --process requires --pin (there's no setup screen to enter it once auto-start begins)"
         );
+    }
+
+    if let Some(frame_kb) = args.synthetic_kb {
+        if !args.server && !args.client {
+            anyhow::bail!("--synthetic-kb requires --server or --client");
+        }
+        let fps = args.synthetic_fps.expect("clap enforces synthetic_fps with synthetic_kb");
+        return synthetic_load::run(synthetic_load::SyntheticLoadArgs {
+            server_url: viewer::settings::DEFAULT_SERVER_URL.to_string(),
+            role: if args.server { app::Role::Offerer } else { app::Role::Answerer },
+            pin: args.pin,
+            frame_kb,
+            fps,
+            duration: std::time::Duration::from_secs(args.synthetic_secs),
+        });
     }
 
     let icon = {

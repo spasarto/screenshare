@@ -1,32 +1,62 @@
+use super::{EncoderInput, Nv12Frame, VideoDecoder, VideoEncoder, bitrate_for};
 use anyhow::{Context, Result};
 use openh264::OpenH264API;
 use openh264::decoder::Decoder;
-use openh264::encoder::{Complexity, Encoder, EncoderConfig, FrameType, UsageType};
-use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
-use std::time::{Duration, Instant};
+use openh264::encoder::{Complexity, Encoder, EncoderConfig, UsageType};
+use openh264::formats::YUVSource;
+
+/// Adapts NV12 planes (as produced by the GPU video processor, phase 2 of
+/// `docs/hardware-encoding-plan.md`) to the encoder's planar `YUVSource`.
+/// The Y plane is used as-is; U/V are de-interleaved once here, which is far
+/// cheaper than the BGRA→I420 conversion it replaces.
+struct Nv12Yuv<'a> {
+    width: usize,
+    height: usize,
+    y: &'a [u8],
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+impl<'a> Nv12Yuv<'a> {
+    fn new(y: &'a [u8], uv: &[u8], width: usize, height: usize) -> Self {
+        let chroma_len = (width / 2) * (height / 2);
+        let mut u = vec![0u8; chroma_len];
+        let mut v = vec![0u8; chroma_len];
+        for i in 0..chroma_len {
+            u[i] = uv[i * 2];
+            v[i] = uv[i * 2 + 1];
+        }
+        Self { width, height, y, u, v }
+    }
+}
+
+impl YUVSource for Nv12Yuv<'_> {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+
+    fn y(&self) -> &[u8] {
+        self.y
+    }
+
+    fn u(&self) -> &[u8] {
+        &self.u
+    }
+
+    fn v(&self) -> &[u8] {
+        &self.v
+    }
+}
 
 pub struct H264Encoder {
     encoder: Encoder,
     width: u32,
     height: u32,
-    /// When the last keyframe went out; `None` until the first one.
-    last_keyframe: Option<Instant>,
 }
-
-/// How long a viewer that joins or loses data mid-stream waits, at most, for
-/// a picture it can decode from. Timed rather than counted in frames: the
-/// capture only delivers frames when the screen changes, so a frame count
-/// meant for 60 fps could stretch to tens of seconds on a quiet screen.
-const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Bits per pixel per frame the encoder is budgeted. 0.07 is what the old
-/// fixed 2 Mbps worked out to at 1280x720 and 30 fps, which looked right for
-/// desktop content; scaling from it keeps larger or faster settings looking
-/// the same rather than starving them.
-const BITS_PER_PIXEL: f64 = 0.07;
-const MIN_BITRATE: u32 = 1_000_000;
-/// Past this the data channel, not the encoder, is the bottleneck.
-const MAX_BITRATE: u32 = 10_000_000;
 
 /// Encoder threads. OpenH264 only runs slices of one frame in parallel, and
 /// caps its thread pool at 4.
@@ -35,11 +65,6 @@ const MAX_ENCODER_THREADS: usize = 4;
 /// size-limited slicing, and one slice leaves every thread but one idle; this
 /// splits a typical 20-40 KB frame into a few slices and a keyframe into ~10.
 const MAX_SLICE_BYTES: u32 = 10_000;
-
-fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
-    let bps = width as f64 * height as f64 * fps as f64 * BITS_PER_PIXEL;
-    (bps as u32).clamp(MIN_BITRATE, MAX_BITRATE)
-}
 
 impl H264Encoder {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
@@ -65,44 +90,38 @@ impl H264Encoder {
         tracing::info!("Encoder {width}x{height} @ {fps} fps: {threads} threads");
         let encoder =
             Encoder::with_api_config(api, config).context("Failed to create H264 encoder")?;
-        Ok(Self {
-            encoder,
-            width,
-            height,
-            last_keyframe: None,
-        })
+        Ok(Self { encoder, width, height })
     }
 
-    /// Encode a BGRA frame into H264 NAL units.
-    pub fn encode(&mut self, bgra_data: &[u8]) -> Result<Vec<u8>> {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let bgra_src = BgraSliceU8::new(bgra_data, (w, h));
-        let yuv = YUVBuffer::from_rgb_source(bgra_src);
-        if self
-            .last_keyframe
-            .is_some_and(|t| t.elapsed() >= KEYFRAME_INTERVAL)
-        {
-            self.encoder.force_intra_frame();
-        }
+    /// Encode an NV12 frame (Y plane, interleaved UV plane) into H264 NAL units.
+    fn encode_planes(&mut self, y: &[u8], uv: &[u8]) -> Result<Vec<u8>> {
+        let yuv = Nv12Yuv::new(y, uv, self.width as usize, self.height as usize);
         let bitstream = self.encoder.encode(&yuv).context("H264 encode failed")?;
         let nals: usize = (0..bitstream.num_layers())
             .filter_map(|i| bitstream.layer(i))
             .map(|l| l.nal_count())
             .sum();
         crate::diag::ENC_NALS.add(nals as u64);
-        if matches!(bitstream.frame_type(), FrameType::IDR) {
-            self.last_keyframe = Some(Instant::now());
-        }
         Ok(bitstream.to_vec())
     }
+}
 
-    pub fn width(&self) -> u32 {
-        self.width
+impl VideoEncoder for H264Encoder {
+    fn encode(&mut self, frame: &EncoderInput) -> Result<Vec<u8>> {
+        let (y, uv) = frame.read_back().context("NV12 readback failed")?;
+        self.encode_planes(&y, &uv)
     }
 
-    pub fn height(&self) -> u32 {
-        self.height
+    fn force_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
+    }
+
+    fn name(&self) -> &str {
+        "OpenH264"
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 }
 
@@ -115,19 +134,40 @@ impl H264Decoder {
         let decoder = Decoder::new().context("Failed to create H264 decoder")?;
         Ok(Self { decoder })
     }
+}
 
-    /// Decode H264 NAL units into an RGBA frame. Returns (width, height, rgba_data).
-    pub fn decode(&mut self, h264_data: &[u8]) -> Result<Option<(u32, u32, Vec<u8>)>> {
-        let yuv = match self.decoder.decode(h264_data) {
+impl VideoDecoder for H264Decoder {
+    /// OpenH264 decodes to strided I420; this packs it into NV12 (Y copied
+    /// row by row, U/V interleaved), one cheap pass instead of the full
+    /// RGBA conversion the viewer used to need.
+    fn decode(&mut self, h264: &[u8]) -> Result<Option<Nv12Frame>> {
+        let yuv = match self.decoder.decode(h264) {
             Ok(Some(yuv)) => yuv,
             Ok(None) => return Ok(None),
             Err(e) => return Err(anyhow::anyhow!("H264 decode failed: {e}")),
         };
 
         let (width, height) = yuv.dimensions();
-        let mut rgba = vec![0u8; width * height * 4];
-        yuv.write_rgba8(&mut rgba);
+        let (y_stride, u_stride, v_stride) = yuv.strides();
+        let (cw, ch) = (width / 2, height / 2);
 
-        Ok(Some((width as u32, height as u32, rgba)))
+        let mut y = vec![0u8; width * height];
+        for (row, dst) in y.chunks_exact_mut(width).enumerate() {
+            dst.copy_from_slice(&yuv.y()[row * y_stride..][..width]);
+        }
+        let mut uv = vec![0u8; cw * 2 * ch];
+        for (row, dst) in uv.chunks_exact_mut(cw * 2).enumerate() {
+            let u = &yuv.u()[row * u_stride..][..cw];
+            let v = &yuv.v()[row * v_stride..][..cw];
+            for (pair, (&u, &v)) in dst.as_chunks_mut::<2>().0.iter_mut().zip(u.iter().zip(v)) {
+                *pair = [u, v];
+            }
+        }
+
+        Ok(Some(Nv12Frame { width: width as u32, height: height as u32, y, uv }))
+    }
+
+    fn name(&self) -> &str {
+        "OpenH264"
     }
 }

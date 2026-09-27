@@ -4577,6 +4577,7 @@ dependencies = [
  "egui",
  "image",
  "openh264",
+ "pollster",
  "qrcode",
  "rand 0.10.2",
  "reqwest",
